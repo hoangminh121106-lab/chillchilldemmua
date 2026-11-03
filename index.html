@@ -1698,6 +1698,9 @@ function loadYtApi(){
     const sc = document.createElement("script"); sc.src = "https://www.youtube.com/iframe_api"; document.head.append(sc); });
   return ytApiP;
 }
+// tắt phụ đề YouTube (CC): YouTube hay tự bật lại khi video bắt đầu chạy, nên tắt nhiều lần
+function noCaptions(p){ const off = () => { try { p.setOption("captions", "track", {}); } catch(e){} try { p.unloadModule("captions"); } catch(e){} try { p.unloadModule("cc"); } catch(e){} };
+  off(); setTimeout(off, 600); setTimeout(off, 2000); }
 async function playYt(id, startSec){
   stopVideo(); tv.mode = "yt"; tv.ytId = id; ytCur = id; ytBox.hidden = false;
   tvStatus.textContent = "TV đang chiếu YouTube, cả quán xem chung.";
@@ -1706,10 +1709,12 @@ async function playYt(id, startSec){
   const start = Math.max(0, Math.floor(startSec || 0));
   if (!ytPlayer) {
     ytPlayer = new YT.Player("ytFrame", { width:356, height:200, videoId:id,
-      playerVars:{ autoplay:1, controls:0, playsinline:1, rel:0, modestbranding:1, start },
-      events:{ onReady: e => { ytReady = true; e.target.setVolume(Math.round(tvVol*100)); e.target.playVideo(); },
+      playerVars:{ autoplay:1, controls:0, playsinline:1, rel:0, modestbranding:1, start, cc_load_policy:0, iv_load_policy:3, hl:"vi", cc_lang_pref:"xx" },
+      events:{ onReady: e => { ytReady = true; e.target.setVolume(Math.round(tvVol*100)); e.target.playVideo(); noCaptions(e.target); },
+               onStateChange: e => { if (e.data === 1 || e.data === 3) noCaptions(e.target); },
+               onApiChange: e => noCaptions(e.target),
                onError: () => { tvStatus.textContent = "Video này không cho phát nhúng ngoài YouTube. Thử link khác nha."; } } });
-  } else if (ytReady) { ytPlayer.loadVideoById({ videoId:id, startSeconds:start }); ytPlayer.setVolume(Math.round(tvVol*100)); }
+  } else if (ytReady) { ytPlayer.loadVideoById({ videoId:id, startSeconds:start }); ytPlayer.setVolume(Math.round(tvVol*100)); noCaptions(ytPlayer); }
 }
 function stopYt(shared){
   ytCur = ""; ytBox.hidden = true;

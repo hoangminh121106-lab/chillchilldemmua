@@ -58,24 +58,30 @@ async function tryGemini(env, prompt, o, tried) {
   return null;
 }
 
+// Model mã nguồn mở viết tiếng Việt dễ sai chính tả / bịa từ: nhắc kỹ + giảm độ "bay"
+const VI_SYS = "Bạn viết tiếng Việt chuẩn chính tả, có dấu đầy đủ, câu tự nhiên đúng kiểu người Sài Gòn nói ngoài đời. Không viết sai chính tả cho vui (cấm 'rùi', 'hok', 'ghê' thay 'đi'), không bịa từ, không ghép chữ vô nghĩa. Mỗi câu phải có nghĩa rõ ràng, đáp đúng ý câu trước. Làm đúng yêu cầu định dạng trong tin nhắn.";
+const viMsgs = (prompt) => [{ role: "system", content: VI_SYS }, { role: "user", content: prompt }];
 const clean = (t) => String(t || "").replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/^[\s\S]*?<\/think>/i, "").trim();
 async function tryGroq(env, prompt, o, tried) {
   const key = env.GROQ_API_KEY; if (!key) { tried.push({ provider: "groq", err: "chưa có GROQ_API_KEY" }); return null; }
-  const models = env.GROQ_MODEL ? [env.GROQ_MODEL] : ["openai/gpt-oss-120b", "llama-3.3-70b-versatile", "openai/gpt-oss-20b"];
+  const models = env.GROQ_MODEL ? [env.GROQ_MODEL] : ["qwen/qwen3.8-27b", "llama-3.3-70b-versatile", "openai/gpt-oss-120b"];   // Qwen, Llama nói tiếng Việt tự nhiên hơn gpt-oss
   for (const model of models) {
     if (resting("q:" + model)) { tried.push({ provider: "groq", model, err: "đang nghỉ (vừa hết lượt)" }); continue; }
     try {
-      const extra = /gpt-oss/.test(model) ? { reasoning_effort: "low", max_completion_tokens: o.maxTokens + 600 } : { max_completion_tokens: o.maxTokens };
-      const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      const extra = /gpt-oss/.test(model) ? { reasoning_effort: "low", max_completion_tokens: o.maxTokens + 600 }
+        : /qwen/.test(model) ? { reasoning_effort: "none", max_completion_tokens: o.maxTokens + 300 } : { max_completion_tokens: o.maxTokens };
+      const send = (ex) => fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-        body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], temperature: Math.min(1, o.temperature), ...extra }),
+        body: JSON.stringify({ model, messages: viMsgs(prompt), temperature: Math.min(.75, o.temperature), top_p: .9, ...ex }),
       });
+      let r = await send(extra);
+      if (r.status === 400 && extra.reasoning_effort) { const { reasoning_effort, ...rest } = extra; r = await send(rest); }   // model không nhận tùy chọn suy nghĩ
       let j = null; try { j = await r.json(); } catch {}
       const text = clean(j?.choices?.[0]?.message?.content);
       tried.push({ provider: "groq", model, status: r.status, err: j?.error?.message ? String(j.error.message).slice(0, 200) : undefined });
       if (text) return { text, provider: "groq", model };
       if (r.status === 429) rest("q:" + model);
-      if (r.status === 401) break;
+      if (r.status === 401) break;   // 404 (model không có) thì thử model kế
     } catch { tried.push({ provider: "groq", model, status: 0 }); }
   }
   return null;
@@ -87,7 +93,7 @@ async function tryCfAI(env, prompt, o, tried) {
   for (const model of models) {
     if (resting("c:" + model)) { tried.push({ provider: "cloudflare", model, err: "đang nghỉ (vừa hết lượt)" }); continue; }
     try {
-      const r = await env.AI.run(model, { messages: [{ role: "user", content: prompt }], max_tokens: o.maxTokens, temperature: Math.min(1, o.temperature) });
+      const r = await env.AI.run(model, { messages: viMsgs(prompt), max_tokens: o.maxTokens, temperature: Math.min(.7, o.temperature) });
       const text = clean(typeof r === "string" ? r : (r?.response ?? r?.choices?.[0]?.message?.content ?? ""));
       tried.push({ provider: "cloudflare", model, status: text ? 200 : 0 });
       if (text) return { text, provider: "cloudflare", model };

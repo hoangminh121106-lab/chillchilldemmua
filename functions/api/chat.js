@@ -1,9 +1,14 @@
 // Khách AI của quán (Cloudflare Pages Function). Biến môi trường đặt ở Cloudflare → Settings → Variables and Secrets.
-// ================= AI: Gemini → Claude → ChatGPT (tự chuyển khi bên trước lỗi / hết lượt / chưa có khóa) =================
+// ================= AI miễn phí: Gemini → Groq → Cloudflare Workers AI =================
+// Bên trước lỗi / hết lượt / chưa có khóa thì tự chuyển sang bên sau. Bên nào vừa báo hết lượt thì nghỉ 1 phút cho đỡ chờ.
 // Khóa (đặt ở biến môi trường, không bỏ vào code):
-//   GEMINI_API_KEY    (+ GEMINI_MODEL nếu muốn ép model, vd: gemini-3.8-flash)
-//   ANTHROPIC_API_KEY (+ ANTHROPIC_MODEL, mặc định claude-haiku-5-5)
-//   OPENAI_API_KEY    (+ OPENAI_MODEL,    mặc định thử gpt-5-mini → gpt-4.1-mini → gpt-4o-mini)
+//   GEMINI_API_KEY (+ GEMINI_MODEL nếu muốn ép model)      — aistudio.google.com
+//   GROQ_API_KEY   (+ GROQ_MODEL nếu muốn ép model)        — console.groq.com
+//   Cloudflare AI: không cần khóa, chỉ cần thêm Binding tên AI (Settings → Bindings → Workers AI)
+
+const cool = new Map(); // tên → hết hạn nghỉ
+const resting = (k) => (cool.get(k) || 0) > Date.now();
+const rest = (k, ms = 60000) => cool.set(k, Date.now() + ms);
 
 const GBASE = "https://generativelanguage.googleapis.com/v1beta";
 let gModels = null; // { at, list }
@@ -34,64 +39,71 @@ async function gemini1(key, model, body) {
 }
 async function gemini2(key, model, body) {
   const first = await gemini1(key, model, { ...body, generationConfig: { ...(body.generationConfig || {}), thinkingConfig: { thinkingBudget: 0 } } });
-  return first.status === 400 && /thinking/i.test(first.err) ? gemini1(key, model, body) : first;
+  return first.status === 400 ? gemini1(key, model, body) : first;   // model không nhận tùy chọn tắt "suy nghĩ": gửi lại bản thường
 }
 async function tryGemini(env, prompt, o, tried) {
   const key = env.GEMINI_API_KEY; if (!key) { tried.push({ provider: "gemini", err: "chưa có GEMINI_API_KEY" }); return null; }
   const body = { contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { temperature: o.temperature, maxOutputTokens: o.maxTokens } };
   if (o.search) body.tools = [{ google_search: {} }];
   for (const model of await geminiModels(key, env.GEMINI_MODEL)) {
+    if (resting("g:" + model)) { tried.push({ provider: "gemini", model, err: "đang nghỉ (vừa hết lượt)" }); continue; }
     let res = await gemini2(key, model, body);
     const hint = res.status === 404 && (res.err.match(/use\s+(?:models\/)?(gemini-[\w.-]+)/i) || [])[1];
     if (hint && hint !== model) { res = await gemini2(key, hint, body); if (res.status === 200) gModels.list = [hint, ...gModels.list.filter(m => m !== hint)]; }
     tried.push({ provider: "gemini", model: res.model, status: res.status, err: res.err || undefined });
     if (res.text) return { text: res.text, provider: "gemini", model: res.model };
-    if (res.status === 429 || /API key/i.test(res.err)) break;  // hết lượt hoặc sai khóa: sang bên khác luôn
+    if (res.status === 429) rest("g:" + res.model);
+    if (/API key/i.test(res.err)) break;
   }
   return null;
 }
-async function tryClaude(env, prompt, o, tried) {
-  const key = env.ANTHROPIC_API_KEY; if (!key) { tried.push({ provider: "claude", err: "chưa có ANTHROPIC_API_KEY" }); return null; }
-  const model = env.ANTHROPIC_MODEL || "claude-haiku-5-5";
-  try {
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST", headers: { "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ model, max_tokens: o.maxTokens, temperature: Math.min(1, o.temperature), messages: [{ role: "user", content: prompt }] }),
-    });
-    let j = null; try { j = await r.json(); } catch {}
-    const text = (j?.content || []).filter(c => c.type === "text").map(c => c.text).join("\n").trim();
-    tried.push({ provider: "claude", model, status: r.status, err: j?.error?.message ? String(j.error.message).slice(0, 200) : undefined });
-    if (text) return { text, provider: "claude", model };
-  } catch (e) { tried.push({ provider: "claude", model, status: 0 }); }
-  return null;
-}
-async function tryOpenAI(env, prompt, o, tried) {
-  const key = env.OPENAI_API_KEY; if (!key) { tried.push({ provider: "chatgpt", err: "chưa có OPENAI_API_KEY" }); return null; }
-  const models = env.OPENAI_MODEL ? [env.OPENAI_MODEL] : ["gpt-5-mini", "gpt-4.1-mini", "gpt-4o-mini"];
+
+const clean = (t) => String(t || "").replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/^[\s\S]*?<\/think>/i, "").trim();
+async function tryGroq(env, prompt, o, tried) {
+  const key = env.GROQ_API_KEY; if (!key) { tried.push({ provider: "groq", err: "chưa có GROQ_API_KEY" }); return null; }
+  const models = env.GROQ_MODEL ? [env.GROQ_MODEL] : ["openai/gpt-oss-120b", "llama-3.3-70b-versatile", "openai/gpt-oss-20b"];
   for (const model of models) {
-    const call = async (extra) => {
-      const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    if (resting("q:" + model)) { tried.push({ provider: "groq", model, err: "đang nghỉ (vừa hết lượt)" }); continue; }
+    try {
+      const extra = /gpt-oss/.test(model) ? { reasoning_effort: "low", max_completion_tokens: o.maxTokens + 600 } : { max_completion_tokens: o.maxTokens };
+      const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-        body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], max_completion_tokens: o.maxTokens + 800, ...extra }),
+        body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], temperature: Math.min(1, o.temperature), ...extra }),
       });
       let j = null; try { j = await r.json(); } catch {}
-      return { status: r.status, text: String(j?.choices?.[0]?.message?.content || "").trim(), err: j?.error?.message ? String(j.error.message).slice(0, 200) : "" };
-    };
-    try {
-      let res = await call({ reasoning_effort: "minimal" });
-      if (res.status === 400 && /reasoning/i.test(res.err)) res = await call({ temperature: Math.min(1.2, o.temperature) });
-      if (res.status === 400 && /temperature/i.test(res.err)) res = await call({});
-      tried.push({ provider: "chatgpt", model, status: res.status, err: res.err || undefined });
-      if (res.text) return { text: res.text, provider: "chatgpt", model };
-      if (res.status === 401 || res.status === 429) break;
-    } catch { tried.push({ provider: "chatgpt", model, status: 0 }); }
+      const text = clean(j?.choices?.[0]?.message?.content);
+      tried.push({ provider: "groq", model, status: r.status, err: j?.error?.message ? String(j.error.message).slice(0, 200) : undefined });
+      if (text) return { text, provider: "groq", model };
+      if (r.status === 429) rest("q:" + model);
+      if (r.status === 401) break;
+    } catch { tried.push({ provider: "groq", model, status: 0 }); }
   }
   return null;
 }
+
+async function tryCfAI(env, prompt, o, tried) {
+  if (!env.AI || typeof env.AI.run !== "function") { tried.push({ provider: "cloudflare", err: "chưa thêm Binding AI" }); return null; }
+  const models = env.CF_AI_MODEL ? [env.CF_AI_MODEL] : ["@cf/meta/llama-3.3-70b-instruct-fp8-fast", "@cf/meta/llama-3.1-8b-instruct-fp8-fast"];
+  for (const model of models) {
+    if (resting("c:" + model)) { tried.push({ provider: "cloudflare", model, err: "đang nghỉ (vừa hết lượt)" }); continue; }
+    try {
+      const r = await env.AI.run(model, { messages: [{ role: "user", content: prompt }], max_tokens: o.maxTokens, temperature: Math.min(1, o.temperature) });
+      const text = clean(typeof r === "string" ? r : (r?.response ?? r?.choices?.[0]?.message?.content ?? ""));
+      tried.push({ provider: "cloudflare", model, status: text ? 200 : 0 });
+      if (text) return { text, provider: "cloudflare", model };
+    } catch (e) {
+      const msg = String(e?.message || e).slice(0, 200);
+      tried.push({ provider: "cloudflare", model, status: 0, err: msg });
+      if (/limit|quota|neuron|429/i.test(msg)) rest("c:" + model, 10 * 60000);
+    }
+  }
+  return null;
+}
+
 // o: { temperature, maxTokens, search }  — search chỉ Gemini làm được (tra Google)
 async function askAI(env, prompt, o) {
   const tried = [];
-  const out = (await tryGemini(env, prompt, o, tried)) || (await tryClaude(env, prompt, o, tried)) || (await tryOpenAI(env, prompt, o, tried));
+  const out = (await tryGemini(env, prompt, o, tried)) || (await tryGroq(env, prompt, o, tried)) || (await tryCfAI(env, prompt, o, tried));
   return { ...(out || {}), tried };
 }
 

@@ -84,6 +84,24 @@
   } };
 })();
 </script>
+<script>
+// Đếm lượt vào quán và thời gian ở lại: tính cả lúc chạy nền (o), kèm riêng lúc đang xem trên màn hình (a). Không lưu IP, không lưu tên.
+(function(){
+  try { if (localStorage.getItem("qc.admin") === "1") return; } catch(e){}   // máy của chủ quán: không đếm
+  const sid = Date.now().toString(36) + Math.random().toString(36).slice(2,10);
+  let vid = ""; try { vid = localStorage.getItem("qc.vid") || ""; if (!vid) { vid = Math.random().toString(36).slice(2,12) + Date.now().toString(36); localStorage.setItem("qc.vid", vid); } } catch(e){ vid = "t" + sid; }
+  const t0 = Date.now(); let active = 0, lastTick = t0, visible = !document.hidden;
+  const tick = () => { const n = Date.now(); if (visible) active += Math.min(n - lastTick, 60000); lastTick = n; };
+  const send = (t) => { tick();
+    const body = JSON.stringify({ s:sid, v:vid, t, a: Math.round(active/1000), o: Math.round((Date.now() - t0)/1000), r: String(document.referrer || "").slice(0,200), w: screen.width || 0 });
+    try { if (t !== "start" && navigator.sendBeacon && navigator.sendBeacon("/api/stat", new Blob([body], { type:"application/json" }))) return; } catch(e){}
+    fetch("/api/stat", { method:"POST", headers:{ "content-type":"application/json" }, body, keepalive:true }).catch(()=>{}); };
+  send("start");
+  setInterval(() => send("ping"), 30000);   // chạy nền vẫn gửi (trình duyệt có thể giãn ra ~1 phút/lần)
+  document.addEventListener("visibilitychange", () => { tick(); visible = !document.hidden; if (!visible) send("hide"); });
+  addEventListener("pagehide", () => send("end"));
+})();
+</script>
 </head>
 <body>
 <title>Quán Cóc Đêm Mưa</title>

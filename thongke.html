@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Thống kê quán</title>
+<style>
+:root{--bg:#10131f;--card:#181c2c;--card2:#20253a;--line:#2e3450;--fg:#efe7d8;--muted:#a59f97;--amber:#ffb85c;--ok:#7fd1a6;--bar:#ffb85c;--bar2:#6f88c9;color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 "Be Vietnam Pro",system-ui,-apple-system,"Segoe UI",sans-serif}
+.wrap{max-width:1100px;margin:0 auto;padding:20px 16px 48px;display:flex;flex-direction:column;gap:16px}
+header{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center;justify-content:space-between}
+h1{margin:0;font-size:24px;letter-spacing:.02em}
+h1 small{display:block;font-size:13px;font-weight:400;color:var(--muted)}
+h2{margin:0 0 10px;font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--amber);font-weight:600}
+.seg{display:flex;gap:4px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:3px;flex-wrap:wrap}
+.seg button{font:inherit;font-size:13px;background:none;border:0;color:var(--muted);padding:6px 12px;border-radius:7px;cursor:pointer}
+.seg button[aria-pressed="true"]{background:var(--card2);color:var(--fg)}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.kpi .l{font-size:12.5px;color:var(--muted)}
+.kpi .v{font-size:26px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.25;margin-top:2px}
+.kpi .s{font-size:12px;color:var(--muted)}
+.kpi.live .v{color:var(--ok)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;min-width:0}
+.card.wide{grid-column:1/-1}
+svg{display:block;width:100%;height:auto;overflow:visible}
+svg text{fill:var(--muted);font-size:11px;font-family:inherit}
+.legend{display:flex;gap:14px;font-size:12.5px;color:var(--muted);margin-top:6px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;vertical-align:-1px}
+.rows{display:flex;flex-direction:column;gap:7px}
+.row{display:grid;grid-template-columns:minmax(90px,38%) 1fr 44px;gap:8px;align-items:center;font-size:13.5px}
+.row .k{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row .t{height:8px;background:var(--card2);border-radius:4px;overflow:hidden}
+.row .t b{display:block;height:100%;background:var(--bar);border-radius:4px}
+.row .n{text-align:right;font-variant-numeric:tabular-nums;color:var(--muted)}
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px dashed var(--line);white-space:nowrap}
+th{color:var(--muted);font-weight:500;font-size:12.5px}
+td.num{font-variant-numeric:tabular-nums}
+.tablewrap{overflow-x:auto}
+.empty{color:var(--muted);font-size:13.5px;margin:4px 0}
+.login{max-width:360px;margin:12vh auto 0;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;display:flex;flex-direction:column;gap:12px}
+.login input{font:inherit;color:var(--fg);background:var(--card2);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+.login button,.btn{font:inherit;font-weight:600;background:var(--amber);color:#1a1206;border:0;border-radius:8px;padding:10px 12px;cursor:pointer}
+.btn.ghost{background:none;color:var(--muted);border:1px solid var(--line);font-weight:500;padding:6px 12px;font-size:13px}
+.err{color:#ff8a8a;font-size:13.5px;min-height:1.2em;margin:0}
+.note{font-size:12.5px;color:var(--muted);margin:0}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok);margin-right:6px}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<form class="login" id="login" hidden>
+  <h1>Thống kê quán<small>Chỉ chủ quán xem được</small></h1>
+  <input type="password" id="pw" placeholder="Mật khẩu (ADMIN_KEY)" autocomplete="current-password" aria-label="Mật khẩu">
+  <button type="submit">Xem thống kê</button>
+  <p class="err" id="err"></p>
+</form>
+
+<div class="wrap" id="app" hidden>
+  <header>
+    <h1>Thống kê Quán Cóc Đêm Mưa<small id="upd">Đang tải…</small></h1>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <div class="seg" id="range" role="group" aria-label="Khoảng thời gian">
+        <button type="button" data-d="1">Hôm nay</button>
+        <button type="button" data-d="7" aria-pressed="true">7 ngày</button>
+        <button type="button" data-d="30">30 ngày</button>
+        <button type="button" data-d="90">90 ngày</button>
+      </div>
+      <button class="btn ghost" id="logout" type="button">Thoát</button>
+    </div>
+  </header>
+
+  <section class="kpis">
+    <div class="kpi live"><div class="l"><span class="dot"></span>Đang ở quán</div><div class="v" id="kOnline">–</div><div class="s">kể cả đang chạy nền</div></div>
+    <div class="kpi"><div class="l">Lượt vào quán</div><div class="v" id="kVisits">–</div><div class="s" id="kVisitsS"></div></div>
+    <div class="kpi"><div class="l">Người khác nhau</div><div class="v" id="kUsers">–</div><div class="s" id="kUsersS"></div></div>
+    <div class="kpi"><div class="l">Ở lại trung bình (cả chạy nền)</div><div class="v" id="kAvg">–</div><div class="s" id="kAvgS"></div></div>
+    <div class="kpi"><div class="l">Tổng thời gian ở quán</div><div class="v" id="kTotal">–</div><div class="s">cộng dồn mọi lượt</div></div>
+  </section>
+
+  <section class="grid">
+    <div class="card wide"><h2 id="chartTitle">Lượt vào theo ngày</h2><div id="chart"></div>
+      <div class="legend"><span><i style="background:var(--bar)"></i>Lượt vào</span><span><i style="background:var(--bar2)"></i>Người khác nhau</span></div></div>
+    <div class="card"><h2>Ở lại bao lâu</h2><div class="rows" id="dur"></div></div>
+    <div class="card"><h2>Giờ nào đông khách</h2><div id="hours"></div></div>
+    <div class="card"><h2>Vào từ đâu</h2><div class="rows" id="refs"></div></div>
+    <div class="card"><h2>Quốc gia</h2><div class="rows" id="countries"></div></div>
+    <div class="card"><h2>Thiết bị</h2><div class="rows" id="devs"></div></div>
+    <div class="card wide"><h2>Lượt vào gần đây</h2><div class="tablewrap"><table>
+      <thead><tr><th>Lúc vào</th><th>Ở lại</th><th>Xem trực tiếp</th><th>Thiết bị</th><th>Quốc gia</th><th>Vào từ</th></tr></thead>
+      <tbody id="recent"></tbody></table></div></div>
+  </section>
+  <p class="note">Thời gian ở lại tính từ lúc mở trang tới lúc đóng, kể cả lúc chạy nền. Riêng điện thoại khóa màn hình lâu thì trình duyệt có thể tạm dừng trang nên tính tới lần cuối còn chạy. Không lưu IP hay tên khách. Máy đã đăng nhập trang này sẽ không bị tính vào số liệu.</p>
+</div>
+
+<script>
+(() => {
+"use strict";
+const $ = id => document.getElementById(id);
+const st = { get(k){ try { return localStorage.getItem(k); } catch(e){ return null; } }, set(k,v){ try { localStorage.setItem(k,v); } catch(e){} }, del(k){ try { localStorage.removeItem(k); } catch(e){} } };
+let key = st.get("qc.adminKey") || "", days = Number(st.get("qc.adminDays")) || 7, timer = 0;
+const regionName = (() => { try { const d = new Intl.DisplayNames(["vi"], { type:"region" }); return c => { try { return c ? d.of(c) : "Không rõ"; } catch(e){ return c; } }; } catch(e){ return c => c || "Không rõ"; } })();
+const fmtDur = s => { s = Math.round(s || 0); if (s < 60) return s + " giây"; const m = Math.floor(s/60); if (m < 60) return m + " phút" + (s%60 && m < 10 ? " " + (s%60) + "s" : ""); const h = Math.floor(m/60); return h + " giờ " + (m%60 ? (m%60) + " phút" : ""); };
+const fmtN = n => Number(n || 0).toLocaleString("vi-VN");
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" })[c]);
+const VN = 7*3600000, DAY = 86400000;
+
+function showLogin(msg){ $("app").hidden = true; $("login").hidden = false; $("err").textContent = msg || ""; $("pw").focus(); }
+$("login").addEventListener("submit", e => { e.preventDefault(); key = $("pw").value.trim(); if (!key) return; load(true); });
+$("logout").addEventListener("click", () => { st.del("qc.adminKey"); key = ""; clearInterval(timer); showLogin(); });
+$("range").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; days = Number(b.dataset.d); st.set("qc.adminDays", String(days)); load(); });
+
+async function load(fromLogin){
+  document.querySelectorAll("#range button").forEach(b => b.setAttribute("aria-pressed", String(Number(b.dataset.d) === days)));
+  let r, j;
+  try { r = await fetch("/api/stats?days=" + days, { headers:{ "x-admin-key": key }, cache:"no-store" }); j = await r.json(); }
+  catch(e){ if (fromLogin) showLogin("Không kết nối được, thử lại nha."); else $("upd").textContent = "Mất kết nối, đang thử lại…"; return; }
+  if (r.status === 401) { st.del("qc.adminKey"); showLogin(fromLogin ? "Sai mật khẩu." : ""); return; }
+  if (!r.ok) { showLogin(j && j.error ? j.error : "Lỗi " + r.status); return; }
+  st.set("qc.adminKey", key); st.set("qc.admin", "1");   // máy này không bị đếm vào thống kê
+  $("login").hidden = true; $("app").hidden = false;
+  render(j);
+  clearInterval(timer); timer = setInterval(() => { if (!document.hidden) load(); }, 30000);
+}
+
+function rows(el, list, fmtK){
+  const max = Math.max(1, ...list.map(x => x.n || 0));
+  el.innerHTML = list.length ? list.map(x => `<div class="row"><span class="k" title="${esc(fmtK(x.k))}">${esc(fmtK(x.k))}</span><span class="t"><b style="width:${(x.n||0)/max*100}%"></b></span><span class="n">${fmtN(x.n)}</span></div>`).join("") : '<p class="empty">Chưa có dữ liệu</p>';
+}
+
+function barChart(el, items, opts){
+  // items: [{label, a, b}] — a: cột chính, b: cột phụ (tùy chọn)
+  const W = opts.w || 720, H = opts.h || 200, padL = 34, padB = 22, padT = 8, n = items.length;
+  const max = Math.max(1, ...items.map(x => Math.max(x.a || 0, x.b || 0)));
+  const step = niceStep(max), top = Math.ceil(max/step)*step;
+  const cw = (W - padL) / n, bw = Math.max(2, Math.min(26, cw * (opts.b ? .38 : .62)));
+  const y = v => padT + (H - padT - padB) * (1 - v/top);
+  let g = "";
+  for (let v = 0; v <= top; v += step) g += `<line x1="${padL}" x2="${W}" y1="${y(v)}" y2="${y(v)}" stroke="#2e3450" stroke-dasharray="${v ? "3 4" : ""}"/><text x="${padL-6}" y="${y(v)+4}" text-anchor="end">${fmtN(v)}</text>`;
+  const every = Math.ceil(n / (opts.maxLabels || 14));
+  items.forEach((x, i) => {
+    const cx = padL + cw*i + cw/2;
+    const a = x.a || 0, b = x.b || 0;
+    const ax = opts.b ? cx - bw - 1 : cx - bw/2;
+    g += `<rect x="${ax}" y="${y(a)}" width="${bw}" height="${Math.max(0, y(0)-y(a))}" rx="2" fill="var(--bar)"><title>${esc(x.title || x.label)}: ${fmtN(a)} ${opts.aName || ""}</title></rect>`;
+    if (opts.b) g += `<rect x="${cx+1}" y="${y(b)}" width="${bw}" height="${Math.max(0, y(0)-y(b))}" rx="2" fill="var(--bar2)"><title>${esc(x.title || x.label)}: ${fmtN(b)} ${opts.bName || ""}</title></rect>`;
+    if (i % every === 0) g += `<text x="${cx}" y="${H-6}" text-anchor="middle">${esc(x.label)}</text>`;
+  });
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(opts.aria || "")}">${g}</svg>`;
+}
+function niceStep(max){ const raw = max/4, p = Math.pow(10, Math.floor(Math.log10(raw))), m = raw/p; return Math.max(1, (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p); }
+
+const cw = el => Math.max(330, Math.min(720, el.clientWidth || 720));
+function render(j){
+  $("upd").textContent = "Cập nhật lúc " + new Date(j.now).toLocaleTimeString("vi-VN", { hour:"2-digit", minute:"2-digit", second:"2-digit" }) + " · tự làm mới mỗi 30 giây";
+  $("kOnline").textContent = fmtN(j.online);
+  $("kVisits").textContent = fmtN(j.visits);
+  $("kVisitsS").textContent = j.days === 1 ? "từ 0h hôm nay" : `trong ${j.days} ngày`;
+  $("kUsers").textContent = fmtN(j.users);
+  $("kUsersS").textContent = j.users ? `${fmtN(j.returning)} người quay lại hơn 1 lần` : "";
+  $("kAvg").textContent = j.visits ? fmtDur(j.avg) : "–";
+  $("kAvgS").textContent = j.visits ? `xem trực tiếp trên màn hình TB ${fmtDur(j.avgActive)} · một nửa số lượt ở trên ${fmtDur(j.median)}` : "";
+  $("kTotal").textContent = j.total ? fmtDur(j.total) : "–";
+
+  if (j.days === 1) {
+    $("chartTitle").textContent = "Lượt vào theo giờ (hôm nay)";
+    const hm = new Map(j.hours.map(x => [x.h, x.visits]));
+    barChart($("chart"), Array.from({ length:24 }, (_, h) => ({ label: h + "h", a: hm.get(h) || 0 })), { w: cw($("chart")), aria:"Lượt vào theo giờ", aName:"lượt", maxLabels: 12 });
+  } else {
+    $("chartTitle").textContent = "Lượt vào theo ngày";
+    const dm = new Map(j.daily.map(x => [x.d, x]));
+    const items = [];
+    for (let d = j.today - j.days + 1; d <= j.today; d++) {
+      const x = dm.get(d) || {}, dt = new Date(d*DAY);
+      const label = `${dt.getUTCDate()}/${dt.getUTCMonth()+1}`;
+      items.push({ label, title: label + (x.visits ? `, ở lại TB ${fmtDur(x.avg)}` : ""), a: x.visits || 0, b: x.users || 0 });
+    }
+    barChart($("chart"), items, { w: cw($("chart")), b:true, aria:"Lượt vào và số người theo ngày", aName:"lượt", bName:"người", maxLabels: cw($("chart")) < 500 ? 7 : 15 });
+  }
+
+  const bk = j.buckets || {};
+  rows($("dur"), [["Dưới 10 giây", bk.b0], ["10 giây – 1 phút", bk.b1], ["1 – 5 phút", bk.b2], ["5 – 15 phút", bk.b3], ["15 – 30 phút", bk.b4], ["Trên 30 phút", bk.b5]].map(([k, n]) => ({ k, n: n || 0 })), k => k);
+
+  const hm = new Map(j.hours.map(x => [x.h, x.visits]));
+  barChart($("hours"), Array.from({ length:24 }, (_, h) => ({ label: h + "h", a: hm.get(h) || 0 })), { w: 340, h: 190, aria:"Lượt vào theo giờ trong ngày", aName:"lượt", maxLabels: 6 });
+
+  rows($("refs"), j.refs, k => k || "trực tiếp");
+  rows($("countries"), j.countries, regionName);
+  rows($("devs"), j.devs, k => k || "Không rõ");
+
+  $("recent").innerHTML = j.recent.length ? j.recent.map(x => {
+    const on = j.now - x.last < 150000;
+    return `<tr><td>${esc(new Date(x.start).toLocaleString("vi-VN", { day:"2-digit", month:"2-digit", hour:"2-digit", minute:"2-digit" }))}</td><td class="num">${on ? '<span class="dot"></span>' : ""}${esc(fmtDur(x.open ?? x.active))}</td><td class="num">${esc(fmtDur(x.active))}</td><td>${esc(x.dev)}</td><td>${esc(regionName(x.country))}</td><td>${esc(x.ref)}</td></tr>`;
+  }).join("") : '<tr><td colspan="6" class="empty">Chưa có ai ghé</td></tr>';
+}
+
+if (key) load(); else showLogin();
+})();
+</script>
+</body>
+</html>

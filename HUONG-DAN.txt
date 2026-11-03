@@ -1,0 +1,56 @@
+QUÁN CÓC ĐÊM MƯA — ĐƯA LÊN chillchilldemmua.pages.dev (Cloudflare Pages, miễn phí)
+
+Trong thư mục này:
+- index.html, audio/      : trang quán
+- config.js               : dán cấu hình Firebase (để mọi người ngồi chung)
+- database.rules.json     : luật bảo vệ, dán vào Firebase
+- functions/api/chat.js   : khách AI (gọi Gemini, khóa giấu trên Cloudflare)
+
+=====================================================
+BƯỚC 1. FIREBASE (nếu chưa làm) — để mọi người ngồi chung
+=====================================================
+1. https://console.firebase.google.com → Create a project → tên chillchilldemmua → tắt Analytics → Create.
+2. Build → Realtime Database → Create Database → Singapore (asia-southeast1) → Start in locked mode → Enable.
+3. Tab Rules → xóa hết → dán toàn bộ file database.rules.json → Publish.
+4. Bánh răng (Project settings) → Your apps → biểu tượng </> → đặt tên → Register app
+   → copy apiKey, authDomain, databaseURL, projectId, appId vào config.js.
+
+=====================================================
+BƯỚC 2. KHÓA GEMINI (nếu chưa có)
+=====================================================
+https://aistudio.google.com → Get API key → Create API key → copy (KHÔNG dán vào file nào).
+
+=====================================================
+BƯỚC 3. GITHUB
+=====================================================
+1. https://github.com → New repository → tên chillchilldemmua → Create.
+   (Nếu kho đã có từ trước: mở kho → Add file → Upload files, thả file mới đè lên.)
+2. "uploading an existing file" → chọn TẤT CẢ bên trong thư mục này (index.html, config.js,
+   database.rules.json, HUONG-DAN.txt, thư mục audio, thư mục functions) → kéo thả → Commit changes.
+
+=====================================================
+BƯỚC 4. CLOUDFLARE PAGES
+=====================================================
+1. https://dash.cloudflare.com → Sign up (miễn phí) → xác nhận email.
+2. Menu trái: "Workers & Pages" (hoặc Compute → Workers & Pages) → "Create application"
+   → chọn tab/đường dẫn "Pages" ("Looking to deploy Pages? Get started")
+   → "Import an existing Git repository" (Connect to Git) → GitHub → cho phép → chọn kho chillchilldemmua
+   → Begin setup.
+3. Màn hình cấu hình:
+   - Project name: chillchilldemmua
+   - Framework preset: None
+   - Build command: để trống
+   - Build output directory: /
+   - Mở "Environment variables (advanced)" → Add: Variable name = GEMINI_API_KEY, Value = khóa Gemini
+     (bấm "Encrypt" nếu có).
+4. Save and Deploy → đợi ~1 phút → link: https://chillchilldemmua.pages.dev
+
+=====================================================
+SAU NÀY
+=====================================================
+- Sửa file trên GitHub → Cloudflare tự xuất bản lại (khoảng 500 lần/tháng miễn phí).
+- Nếu thêm/sửa khóa sau khi đã xuất bản: Settings → Variables and Secrets → thêm/sửa
+  → Deployments → bấm "..." ở bản mới nhất → Retry deployment.
+- Tên miền riêng: Custom domains → Set up a custom domain.
+
+Âm thanh mưa, sấm, phố, người: thư viện của dự án Moodist (giấy phép Pixabay / CC0).

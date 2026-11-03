@@ -1,0 +1,2392 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="description" content="Quán cà phê cóc vỉa hè Sài Gòn đêm mưa: ngồi ghế đẩu, gọi nước, tám chuyện với khách trong quán.">
+<meta property="og:title" content="Quán Cóc Đêm Mưa">
+<meta property="og:description" content="Ghé quán cà phê cóc vỉa hè Sài Gòn đêm mưa, ngồi ghế đẩu, nghe mưa, tám chuyện.">
+<style>:root{color-scheme:dark;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0;font:14px system-ui,-apple-system,"Segoe UI",sans-serif}img{max-width:100%}[hidden]{display:none!important}</style>
+<script src="config.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-database-compat.js"></script>
+<script>
+// Cầu nối: thay phần "ngồi chung" bằng Firebase và phần "khách AI" bằng /api/chat (Gemini)
+(function(){
+  "use strict";
+  const cfg = window.FIREBASE_CONFIG || {};
+  let room = null;
+  function makeRoom(){
+    try { firebase.initializeApp(cfg); } catch(e) { return null; }
+    const db = firebase.database(), TS = firebase.database.ServerValue.TIMESTAMP;
+    const me = Date.now().toString(36).padStart(9,"0") + Math.random().toString(36).slice(2,8);
+    const ref = db.ref("rooms/main/peers/" + me);
+    let mine = {}, conn = false, offset = 0, last = {}, peersLoaded = false;
+    window.QC_TIME = () => Date.now() + offset;
+    const peerCbs = [], connCbs = [], tvCbs = [], npcCbs = [], sayCbs = [];
+    db.ref(".info/serverTimeOffset").on("value", s => { offset = s.val() || 0; });
+    const push = () => { if (conn) ref.set({ p: mine, t: TS }).catch(()=>{}); };
+    db.ref(".info/connected").on("value", s => {
+      conn = !!s.val();
+      if (conn) { ref.onDisconnect().remove(); push(); }
+      connCbs.forEach(f => f(conn));
+    });
+    setInterval(push, 60000);
+    const emit = () => {
+      const now = Date.now() + offset;
+      const peers = Object.entries(last).filter(([k,o]) => o && (k === me || now - (o.t || 0) < 180000))
+        .map(([k,o]) => ({ peer:k, presence: o.p || {}, isMe: k === me, sameTab: k === me, kind:"viewer", by:null, guest:false, updatedAt: Date.now() }));
+      peerCbs.forEach(f => f({ peers, joined:[], left:[], updated:[] }));
+    };
+    db.ref("rooms/main/peers").on("value", s => { last = s.val() || {}; peersLoaded = true; emit(); });
+    const activeKeys = () => { const now = Date.now() + offset; return Object.entries(last).filter(([k,o]) => o && (k === me || now - (o.t || 0) < 180000)).map(([k]) => k).sort(); };
+    db.ref("rooms/main/npcs").on("value", s => { const v = s.val(); npcCbs.forEach(f => f(v && v.list ? v.list : null)); });
+    const t0 = Date.now();
+    db.ref("rooms/main/say").limitToLast(30).on("child_added", s => { const v = s.val(); if (!v || (v.at || 0) < t0 + offset - 1500) return; sayCbs.forEach(f => f(v)); });
+    setInterval(() => { if (window.QC_SYNC.isLeader()) db.ref("rooms/main/say").orderByChild("at").endAt(Date.now() + offset - 600000).once("value", s => s.forEach(c => { c.ref.remove(); })); }, 300000);
+    db.ref("rooms/main/tv").on("value", s => { const v = s.val(); tvCbs.forEach(f => f(v, Date.now() + offset)); });
+    let timer = 0;
+    window.QC_SYNC = {
+      setTv(id){ return id ? db.ref("rooms/main/tv").set({ id, at: TS }) : db.ref("rooms/main/tv").remove(); },
+      onTv(f){ tvCbs.push(f); },
+      npcs: true,
+      isLeader(){ if (!peersLoaded || !conn) return false; const k = activeKeys(); return !k.length || k[0] === me; },
+      setNpcs(list){ return db.ref("rooms/main/npcs").set({ list, at: TS }).catch(()=>{}); },
+      onNpcs(f){ npcCbs.push(f); },
+      sayNpc(nick, text){ return db.ref("rooms/main/say").push({ nick: String(nick).slice(0,20), text: String(text).slice(0,100), at: TS }).catch(()=>{}); },
+      onSay(f){ sayCbs.push(f); },
+    };
+    return {
+      presence(patch){
+        mine = Object.assign({}, mine, patch);
+        for (const k of Object.keys(mine)) if (mine[k] === null || mine[k] === undefined) delete mine[k];
+        clearTimeout(timer); timer = setTimeout(push, 120);
+        return Promise.resolve();
+      },
+      onPeers(f, err){ peerCbs.push(f); setTimeout(emit, 0); return () => {}; },
+      onConnection(f){ connCbs.push(f); setTimeout(() => f(conn), 0); return () => {}; },
+      connected(){ return conn; },
+    };
+  }
+  async function sample(prompt){
+    const r = await fetch("/api/chat", { method:"POST", headers:{ "content-type":"application/json" }, body: JSON.stringify({ prompt: String(prompt) }) });
+    if (r.status === 429) throw { code:"rate_limited", message:"Chậm lại xíu" };
+    if (!r.ok) throw { code:"upstream_error", message:String(r.status) };
+    const j = await r.json();
+    return { text: j.text || "", truncated: false };
+  }
+  window.QC_AI_NAME = "Gemini";
+  window.claude = { use: async (name) => {
+    if (name === "room") { if (!room && cfg.apiKey && cfg.databaseURL && window.firebase) room = makeRoom(); return room; }
+    if (name === "sample") return sample;
+    return null;
+  } };
+})();
+</script>
+</head>
+<body>
+<title>Quán Cóc Đêm Mưa</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Oswald:wght@500;600&family=Be+Vietnam+Pro:wght@400;500;600&display=swap">
+<style>
+/* Layout: the rainy street scene up top; under it a full-width chat strip, then the counter (you, menu, who's here). Single committed night look. */
+:root{
+  --night:#10131f;
+  --surface:#181c2c;
+  --surface-2:#20253a;
+  --line:#2e3450;
+  --fg:#efe7d8;
+  --muted:#a59f97;
+  --amber:#ffb85c;
+  --neon:#ff6a95;
+  --leaf:#3fae6e;
+  --ok:#7fd1a6;
+  --display:"Oswald","Arial Narrow",system-ui,sans-serif;
+  --body:"Be Vietnam Pro",system-ui,-apple-system,"Segoe UI",sans-serif;
+  color-scheme:dark;
+}
+html,body{background:var(--night);color:var(--fg)}
+body{font-family:var(--body);font-size:15px;line-height:1.5}
+.wrap{max-width:1240px;margin:0 auto;padding-block:20px 40px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));display:flex;flex-direction:column;gap:16px}
+.top{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:10px 16px}
+.brand{display:flex;flex-direction:column;gap:2px;min-width:0}
+h1{font-family:var(--display);font-weight:600;font-size:clamp(26px,5vw,36px);letter-spacing:.04em;text-transform:uppercase;margin:0;color:var(--neon);text-shadow:0 0 12px color-mix(in srgb,var(--neon) 55%,transparent);text-wrap:balance}
+.sub{color:var(--muted);margin:0}
+.pill{font-size:13px;padding:5px 12px;border-radius:999px;border:1px solid var(--line);background:var(--surface);color:var(--muted);display:inline-flex;align-items:center;gap:8px;white-space:nowrap}
+.pill::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--muted)}
+.pill[data-state="on"]{color:var(--fg)}
+.pill[data-state="on"]::before{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.pill[data-state="off"]::before{background:var(--amber)}
+.stage{position:relative;border-radius:14px;overflow:hidden;border:1px solid var(--line);background:var(--night)}
+.stagebtns{position:absolute;top:10px;right:10px;display:flex;gap:8px;top:max(10px,env(safe-area-inset-top,0px))}
+.stagebtns .float{position:static}
+.popmenu{position:absolute;left:0;top:0;width:min(280px,calc(100% - 24px));max-height:calc(100% - 24px);overflow:auto;box-sizing:border-box;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:10px 12px 12px;display:flex;flex-direction:column;gap:6px;z-index:5;box-shadow:0 10px 30px rgba(0,0,0,.5)}
+.popmenu[hidden]{display:none}
+.popmenu h3{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:2px 0 0;font-weight:600}
+.popmenu .menu{grid-template-columns:1fr 1fr}
+.popmenu .item{font-size:13px;padding:6px 8px}
+.pmhead{display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--amber);font-weight:600}
+.pmclose{font:600 18px var(--body);line-height:1;color:var(--fg);background:none;border:0;cursor:pointer;padding:2px 6px;border-radius:6px}
+.dmbox{position:absolute;width:min(240px,calc(100% - 24px));box-sizing:border-box;background:color-mix(in srgb,var(--surface) 94%,transparent);border:1px solid var(--line);border-radius:12px;padding:8px 10px;display:flex;flex-direction:column;gap:6px;z-index:5;box-shadow:0 8px 24px rgba(0,0,0,.45);font-size:13px}
+.dmbox[hidden]{display:none}
+.dmhead{display:flex;align-items:center;justify-content:space-between;font-weight:600;color:var(--amber)}
+.dmhead button{background:none;border:0;color:var(--muted);font-size:18px;line-height:1;cursor:pointer;padding:0 2px}
+.dmlog{list-style:none;margin:0;padding:0;max-height:120px;overflow:auto;display:flex;flex-direction:column;gap:4px}
+.dmlog li{padding:3px 8px;border-radius:10px;max-width:85%;background:var(--surface-2);align-self:flex-start;word-break:break-word}
+.dmlog li.me{align-self:flex-end;background:color-mix(in srgb,var(--amber) 22%,var(--surface-2))}
+.dmlog li.typing{color:var(--muted);font-style:italic;background:none}
+.dmform{display:flex;gap:6px}
+.dmform input{flex:1;min-width:0;background:var(--night);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:5px 8px;font:inherit}
+.dmform button{background:var(--amber);color:#1a1206;border:0;border-radius:8px;padding:0 10px;font-weight:600;cursor:pointer}
+.connbox{display:flex;flex-direction:column;align-items:flex-end;gap:6px}
+.copyline{font:500 11px var(--body);color:color-mix(in srgb,var(--fg) 78%,transparent)}
+.stage:fullscreen{border:0;border-radius:0;width:100%;height:100%}
+.stage.pseudo-fs{position:fixed;inset:0;z-index:1000;border:0;border-radius:0}
+.stage:fullscreen canvas,.stage.pseudo-fs canvas{height:100%;aspect-ratio:auto}
+html.noscroll,html.noscroll body{overflow:hidden}
+.drop{position:absolute;inset:12px;display:grid;place-items:center;border:2px dashed var(--amber);border-radius:14px;background:color-mix(in srgb,var(--night) 60%,transparent);color:var(--amber);font:600 18px var(--body);pointer-events:none}
+.drop[hidden]{display:none}
+#ytBox{position:absolute;left:0;top:0;width:356px;height:200px;transform-origin:0 0;pointer-events:none;overflow:hidden;background:#000}
+#ytBox iframe{width:356px;height:200px;border:0;display:block}
+canvas{display:block;width:100%;aspect-ratio:960/600;cursor:default;touch-action:manipulation}
+.stage.narrow canvas{aspect-ratio:640/600}
+.float{position:absolute;right:10px;top:10px;font:500 13px var(--body);color:var(--fg);background:color-mix(in srgb,var(--night) 78%,transparent);border:1px solid var(--line);border-radius:999px;padding:6px 12px;cursor:pointer}
+.float[aria-pressed="true"]{border-color:var(--amber);color:var(--amber)}
+.panel{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:10px;min-width:0}
+.card.wide{grid-column:1/-1}
+.card h2{font-family:var(--display);font-weight:500;font-size:15px;letter-spacing:.08em;text-transform:uppercase;margin:0;color:var(--amber)}
+.card h3{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:2px 0 0;font-weight:600}
+label.f{font-size:13px;color:var(--muted);display:flex;flex-direction:column;gap:4px}
+input[type=text],select{font:inherit;color:var(--fg);background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;width:100%;min-width:0;box-sizing:border-box}
+input[type=text]:focus-visible,select:focus-visible,button:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+.hint{font-size:12.5px;color:var(--muted);margin:0}
+button.b{font:500 14px var(--body);color:var(--fg);background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;cursor:pointer}
+button.b:hover{border-color:var(--amber)}
+button.b:disabled{opacity:.45;cursor:not-allowed}
+.menu{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.item{display:flex;align-items:center;justify-content:space-between;gap:8px;text-align:left;min-width:0}
+.item span:first-child{min-width:0}
+.item .p{color:var(--muted);font-variant-numeric:tabular-nums;font-size:12.5px;flex:none}
+.item[aria-pressed="true"]{border-color:var(--amber);background:color-mix(in srgb,var(--amber) 14%,var(--surface-2))}
+.acts{display:flex;flex-wrap:wrap;gap:6px}
+.acts .act{font-size:13px;padding:5px 10px;border-radius:999px}
+.soundbar{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:10px 14px}
+.soundbar label{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--muted);flex:1 1 220px;min-width:0}
+.soundbar input[type=range]{flex:1;min-width:0;accent-color:var(--amber)}
+#soundBtn[aria-pressed="true"]{border-color:var(--amber);color:var(--amber)}
+.tvbar{display:flex;flex-direction:column;gap:8px;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.tvtag{font-family:var(--display);font-weight:500;letter-spacing:.08em;color:var(--amber);font-size:15px}
+.tvrow{display:flex;flex-wrap:wrap;gap:8px}
+.tvrow input{flex:1 1 220px}
+.filebtn{display:inline-flex;align-items:center}
+.ytlink{color:var(--amber);font-size:14px;font-weight:500}
+.msgrow{display:flex;gap:8px}
+.aistat{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;font-size:12.5px;color:var(--muted)}
+.aistat[data-ok="1"] #aiStat{color:var(--ok)}
+.aifix{font-size:12.5px;padding:4px 10px}
+.msgrow input{flex:1}
+.chatlog{list-style:none;margin:0;padding:10px 12px;display:flex;flex-direction:column;gap:6px;height:220px;overflow-y:auto;background:var(--surface-2);border:1px solid var(--line);border-radius:10px}
+.chatlog li{font-size:14px;line-height:1.45;overflow-wrap:anywhere}
+.chatlog .who{font-weight:600;margin-right:6px}
+.chatlog .tag{font-size:10.5px;font-weight:600;letter-spacing:.06em;border:1px solid var(--line);border-radius:4px;padding:0 4px;margin-right:6px;color:var(--muted);vertical-align:1px}
+.chatlog .sys{color:var(--muted);font-style:italic;font-size:13px}
+.chatlog .typing{color:var(--muted);font-size:13px}
+ul.people{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px;max-height:220px;overflow:auto}
+ul.people li{display:flex;justify-content:space-between;gap:10px;font-size:14px;border-bottom:1px dashed var(--line);padding-bottom:5px;min-width:0}
+ul.people li .n{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+ul.people li .d{color:var(--muted);font-size:12.5px;text-align:right}
+ul.people li.me .n{color:var(--amber)}
+ul.people li.sim .n{color:var(--muted)}
+.toggle{display:flex;gap:8px;align-items:flex-start;font-size:13px;color:var(--muted);cursor:pointer}
+.toggle input{margin-top:3px;accent-color:var(--amber)}
+@media (max-width:420px){.menu{grid-template-columns:1fr}}
+@media (prefers-reduced-motion:reduce){h1{text-shadow:none}}
+</style>
+
+<div class="wrap" id="tools">
+  <header class="top">
+    <div class="brand">
+      <h1>Quán Cóc Đêm Mưa</h1>
+      <p class="sub">Kéo ghế đẩu, gọi ly nước, tám chuyện với khách trong quán.</p>
+    </div>
+    <div class="connbox">
+      <div class="copyline">© Bản quyền thuộc cá nhân Hoàng Minh</div>
+      <div id="conn" class="pill" data-state="wait" role="status">Đang mở cửa quán…</div>
+    </div>
+  </header>
+
+  <div class="stage" id="stage">
+    <canvas id="scene" role="img" aria-label="Quán cà phê vỉa hè Sài Gòn đêm mưa, dãy nhà ống, dây điện chằng chịt, xe cộ chạy ngang"></canvas>
+    <div class="stagebtns">
+      <button class="float" id="soundQuick" type="button" aria-pressed="false">Bật âm thanh</button>
+      <button class="float" id="fsBtn" type="button" aria-pressed="false">Toàn màn hình</button>
+    </div>
+    <div class="dmbox" id="dmBox" role="dialog" aria-label="Chat riêng" hidden>
+      <div class="dmhead"><span id="dmTitle"></span><button id="dmClose" type="button" aria-label="Đóng">×</button></div>
+      <ul class="dmlog" id="dmLog"></ul>
+      <form class="dmform" id="dmForm" autocomplete="off"><input id="dmMsg" maxlength="80" placeholder="Nói gì đó…" aria-label="Tin nhắn"><button type="submit">Gửi</button></form>
+    </div>
+    <div class="popmenu" id="popMenu" role="dialog" aria-label="Thực đơn của cô Ba" hidden>
+      <div class="pmhead"><span id="pmTitle">Dạ, dùng gì nè?</span><button class="pmclose" id="pmClose" type="button" aria-label="Đóng">×</button></div>
+      <h3>Nước</h3><div class="menu" id="pmDrinks"></div>
+      <h3>Đồ ăn</h3><div class="menu" id="pmFoods"></div>
+    </div>
+    <div id="ytBox" hidden><div id="ytFrame"></div></div>
+    <div class="drop" id="dropHint" hidden>Thả video vào đây để chiếu lên TV</div>
+  </div>
+
+  <div class="soundbar">
+    <button class="b" id="soundBtn" aria-pressed="false" type="button">Bật âm thanh</button>
+    <label for="volRain">Tiếng mưa <input type="range" id="volRain" min="0" max="100" value="80"></label>
+    <label for="volOther">Xe cộ, phố, người <input type="range" id="volOther" min="0" max="100" value="55"></label>
+    <label for="volTv">TV <input type="range" id="volTv" min="0" max="100" value="70"></label>
+  </div>
+
+  <div class="tvbar">
+    <span class="tvtag">TV</span>
+    <form id="ytForm" class="tvrow">
+      <input type="text" id="ytUrl" placeholder="Dán link YouTube để cả quán xem chung…" autocomplete="off" aria-label="Link YouTube">
+      <button class="b" type="submit">Chiếu</button>
+    </form>
+    <div class="tvrow">
+      <label class="b filebtn" for="tvFile">Chọn video để chiếu</label>
+      <input type="file" id="tvFile" accept="video/*" hidden>
+      <button class="b" id="tvBongda" type="button">Kênh bóng đá</button>
+      <button class="b" id="tvOff" type="button">Tắt TV</button>
+    </div>
+    <p class="hint" id="tvStatus">TV đang chiếu bóng đá. Dán link YouTube để cả quán xem chung, hoặc chọn/kéo thả video trong máy để xem riêng.</p>
+  </div>
+
+  <section class="panel">
+    <div class="card wide">
+      <h2>Tám chuyện</h2>
+      <div class="aistat"><span id="aiStat">Khách AI: đang kiểm tra…</span><button class="b aifix" id="aiFix" type="button" hidden>Bật khách AI thông minh</button></div>
+      <ul class="chatlog" id="chatlog" aria-live="polite"></ul>
+      <div class="acts" id="acts" role="group" aria-label="Làm trò"></div>
+      <form id="msgForm" class="msgrow">
+        <input type="text" id="msg" maxlength="80" placeholder="ê mưa lớn quá tụi mày…" autocomplete="off" aria-label="Tin nhắn">
+        <button class="b" type="submit" id="sendBtn">Gửi</button>
+      </form>
+      <p class="hint">Khách có nhãn AI là khách giả lập, cả quán cùng thấy và cùng nghe họ nói. Gọi tên (vd: "anh Tư ơi") để đúng người trả lời. Người thật trong quán thì ai cũng thấy tin của nhau.</p>
+    </div>
+
+    <div class="card">
+      <h2>Bạn</h2>
+      <label class="f" for="nick">Tên hiện trên đầu
+        <input type="text" id="nick" maxlength="16" placeholder="vd: Nguyện" autocomplete="off">
+      </label>
+      <label class="f" for="seatSel">Ghế
+        <select id="seatSel"></select>
+      </label>
+      <p class="hint">Hoặc chạm thẳng vào một ghế đẩu trống trong tranh.</p>
+      <label class="f" for="styleSel">Kiểu bàn ghế
+        <select id="styleSel">
+          <option value="mix">Trộn: nhựa đỏ sát tường, gỗ dãy ngoài</option>
+          <option value="nhua">Ghế nhựa đỏ, bàn inox</option>
+          <option value="go">Ghế gỗ, bàn gỗ (vibe Hà Nội)</option>
+        </select>
+      </label>
+      <label class="f" for="genderSel">Giới tính nhân vật
+        <select id="genderSel">
+          <option value="m">Nam</option>
+          <option value="f">Nữ</option>
+        </select>
+      </label>
+      <label class="f" for="outfitSel">Bận đồ gì
+        <select id="outfitSel"></select>
+      </label>
+      <div><button class="b" id="leave" type="button" disabled>Đứng dậy</button></div>
+    </div>
+
+    <div class="card">
+      <h2>Thực đơn</h2>
+      <h3>Nước</h3>
+      <div class="menu" id="drinks" role="group" aria-label="Nước"></div>
+      <h3>Đồ ăn</h3>
+      <div class="menu" id="foods" role="group" aria-label="Đồ ăn"></div>
+      <p class="hint">Giá cho có không khí, không thu tiền thật.</p>
+    </div>
+
+    <div class="card">
+      <h2>Trong quán</h2>
+      <ul class="people" id="people"></ul>
+      <label class="toggle" for="simT"><input type="checkbox" id="simT" checked> <span>Hiện khách AI giả lập (cả quán dùng chung một nhóm khách AI).</span></label>
+    </div>
+  </section>
+  <p class="hint credit">Tiếng mưa, sấm, phố và người lấy từ thư viện âm thanh của dự án Moodist (giấy phép Pixabay / CC0).</p>
+</div>
+
+<script>
+(() => {
+"use strict";
+const LW = 960, LH = 600;
+const DRINKS = {
+  den:     {name:"Cà phê đen",    price:"15k", fill:"#2a160c", top:"#4a2a16"},
+  suada:   {name:"Cà phê sữa đá", price:"18k", fill:"#9b6a42", top:"#c99a6d"},
+  bacxiu:  {name:"Bạc xỉu",       price:"20k", fill:"#d8b48c", top:"#efd8bb"},
+  trada:   {name:"Trà đá",        price:"5k",  fill:"#b8742a", top:"#d9a35a"},
+  sting:   {name:"Sting dâu",     price:"12k", fill:"#d0233a", top:"#ff5a6e"},
+  suachua: {name:"Sữa chua đá",   price:"15k", fill:"#eedfe3", top:"#ffffff"},
+};
+const FOODS = {
+  mi:      {name:"Mì gói 1 trứng", price:"25k", wait:"Mì gói một trứng hả, đợi em ba phút nghen!"},
+  banhmi:  {name:"Bánh mì ốp la",  price:"20k", wait:"Bánh mì ốp la có liền nè!"},
+  btt:     {name:"Bánh tráng trộn",price:"15k", wait:"Bánh tráng trộn nè, ăn cay hông anh chị?"},
+  trung:   {name:"Trứng gà nướng", price:"8k",  wait:"Trứng nướng còn nóng hổi nè, ăn liền đi nghen!"},
+  hd:      {name:"Hướng dương",    price:"10k", wait:"Hướng dương một dĩa nghen!"},
+};
+const OUTFITS = {
+  thun:    "Áo thun, quần jean",
+  baloi:   "Áo ba lỗ, quần đùi thun",
+  somi:    "Sơ mi, quần tây",
+  hocsinh: "Áo trắng quần xanh (đồng phục)",
+  dobo:    "Đồ bộ bông",
+  shipper: "Áo khoác giao hàng",
+};
+const ROWS = [{y:380, tables:[330,466,602,738], name:"Dãy sát tường"}, {y:452, tables:[400,536,672], name:"Dãy ngoài"}];
+const SEATS = [];
+ROWS.forEach((r,ri)=>{ let n=1; r.tables.forEach(tx=>{ for (const side of [-1,1]) SEATS.push({x:tx+side*36, y:r.y, tx, ty:r.y-6, side, row:ri, label:`${r.name}, ghế ${n++}`}); }); });
+const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+const $ = id => document.getElementById(id);
+const canvas = $("scene"), ctx = canvas.getContext("2d"), stage = $("stage");
+const store = {
+  get(k){ try { return localStorage.getItem(k); } catch(e){ return null; } },
+  set(k,v){ try { localStorage.setItem(k,v); } catch(e){} }
+};
+const clean = (s,n) => typeof s === "string" ? s.replace(/[\u0000-\u001f\u007f​-‏‪-‮⁦-⁩]/g,"").replace(/\s+/g," ").trim().slice(0,n) : "";
+const rnd = a => a[Math.floor(Math.random()*a.length)];
+
+let furnStyle = ["mix","nhua","go"].includes(store.get("qc.style")) ? store.get("qc.style") : "mix";
+// ---------- me ----------
+let hue = Number(store.get("qc.hue"));
+if (!Number.isFinite(hue)) { hue = Math.floor(Math.random()*360); store.set("qc.hue", String(hue)); }
+const savedOutfit = store.get("qc.outfit");
+const savedG = store.get("qc.g");
+const me = { g: savedG === "f" ? "f" : "m", outfit: OUTFITS[savedOutfit] ? savedOutfit : "thun", nick: store.get("qc.nick") === null ? "Người đẹp" : clean(store.get("qc.nick"), 16), seat:null, drink:null, food:null, msg:"", msgAt:0, hue, servedAt:0, foodAt:0, act:"", actAt:0 };
+const pending = { drink:null, food:null };
+const myName = () => me.nick || "Khách lạ";
+
+// ---------- chat log ----------
+const chat = [];
+const chatEl = $("chatlog");
+function pushChat(e){ chat.push({...e, at:Date.now()}); if (chat.length > 80) chat.shift(); renderChat(); }
+let dmNick = null;
+function renderDm(){
+  if (!dmNick) return;
+  const box = $("dmBox"), log = $("dmLog");
+  if (!npcs.some(n=>n.nick===dmNick)) { closeDm(); return; }
+  log.textContent = "";
+  for (const e of chat.filter(e => (e.kind==="me" && e.to===dmNick) || (e.kind==="ai" && e.who===dmNick && e.at >= box._t0)).slice(-8)) {
+    const li = document.createElement("li"); if (e.kind==="me") li.className = "me"; li.textContent = e.text; log.append(li);
+  }
+  if (typing.has(dmNick)) { const li = document.createElement("li"); li.className = "typing"; li.textContent = "đang gõ…"; log.append(li); }
+  log.scrollTop = log.scrollHeight;
+}
+function openDm(n){
+  const box = $("dmBox"); dmNick = n.nick; box._t0 = Date.now() - 1;
+  $("dmTitle").textContent = n.nick; box.hidden = false; renderDm();
+  const s = SEATS[n.seat], sc = view.scale, sw = stage.clientWidth, sh = stage.clientHeight, bw = box.offsetWidth, bh = box.offsetHeight;
+  const cx = (s.x - view.off)*sc, cy = (s.y - 90 - view.offY)*sc;
+  box.style.left = Math.max(12, Math.min(sw - bw - 12, cx - bw/2)) + "px";
+  box.style.top = Math.max(12, Math.min(sh - bh - 12, cy - bh)) + "px";
+  $("dmMsg").focus({preventScroll:true});
+}
+function closeDm(){ dmNick = null; $("dmBox").hidden = true; }
+function renderChat(){
+  queueMicrotask(renderDm);
+  const atBottom = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight < 40;
+  chatEl.textContent = "";
+  for (const e of chat){
+    const li = document.createElement("li");
+    if (e.kind === "sys") { li.className = "sys"; li.textContent = e.text; }
+    else {
+      if (e.kind === "ai") { const t = document.createElement("span"); t.className = "tag"; t.textContent = "AI"; li.append(t); }
+      const w = document.createElement("span"); w.className = "who"; w.textContent = e.who + (e.kind==="me" ? " (bạn)" : "");
+      w.style.color = e.kind === "me" ? "var(--amber)" : e.kind === "owner" ? "var(--leaf)" : `hsl(${e.hue} 70% 72%)`;
+      const tx = document.createElement("span"); tx.textContent = e.text;
+      li.append(w, tx);
+    }
+    chatEl.append(li);
+  }
+  if (typing.size) for (const n of typing){ const li = document.createElement("li"); li.className = "typing"; li.textContent = `${n} đang gõ…`; chatEl.append(li); }
+  if (atBottom) chatEl.scrollTop = chatEl.scrollHeight;
+}
+const typing = new Set();
+
+// ---------- room ----------
+let room = null, others = [];
+const actSeen = new Map(), lastAct = new Map(), lastMsg = new Map(), msgSeen = new Map(), lastDrink = new Map(), served = new Map(), lastFood = new Map(), foodServed = new Map(), greeted = new Set();
+function sendPresence(){
+  if (!room) return;
+  room.presence({ nick: myName(), g: me.g, act: me.act, actAt: me.actAt, outfit: me.outfit, seat: me.seat, drink: me.drink, food: me.food, msg: me.msg, msgAt: me.msgAt, hue: me.hue }).catch(()=>{});
+}
+function readPeer(p){
+  const pr = p.presence || {};
+  const seat = Number.isInteger(pr.seat) && pr.seat >= 0 && pr.seat < SEATS.length ? pr.seat : null;
+  const drink = typeof pr.drink === "string" && DRINKS[pr.drink] ? pr.drink : null;
+  const food = typeof pr.food === "string" && FOODS[pr.food] ? pr.food : null;
+  const h = Number(pr.hue);
+  const outfit = typeof pr.outfit === "string" && OUTFITS[pr.outfit] ? pr.outfit : "thun";
+  const g = pr.g === "f" ? "f" : "m";
+  const act = typeof pr.act === "string" && ACTS[pr.act] ? pr.act : "";
+  return { key:p.peer, g, act, actAt: Number(pr.actAt)||0, outfit, nick: clean(pr.nick,16) || "Khách lạ", seat, drink, food, msg: clean(pr.msg,80), msgAt: Number(pr.msgAt)||0,
+           hue: Number.isFinite(h) ? ((h%360)+360)%360 : 200, real:true, otherTab:p.isMe, hasNick: typeof pr.nick === "string" };
+}
+function onPeers(list){
+  const now = Date.now();
+  others = list.filter(p => !p.sameTab && p.kind === "viewer").map(readPeer);
+  for (const o of others) {
+    const mk = o.msg + "|" + o.msgAt;
+    if (o.msg && lastMsg.has(o.key) && mk !== lastMsg.get(o.key)) { msgSeen.set(o.key, now); if (!o.otherTab) pushChat({who:o.nick, text:o.msg, kind:"peer", hue:o.hue}); }
+    else if (o.msg && !lastMsg.has(o.key) && now - 0 > 0) msgSeen.set(o.key, 0);
+    lastMsg.set(o.key, mk);
+    const ak = o.act + "|" + o.actAt;
+    if (o.act && lastAct.has(o.key) && ak !== lastAct.get(o.key)) actSeen.set(o.key, now);
+    lastAct.set(o.key, ak);
+    if (o.drink && o.drink !== lastDrink.get(o.key)) served.set(o.key, now);
+    lastDrink.set(o.key, o.drink);
+    if (o.food && o.food !== lastFood.get(o.key)) foodServed.set(o.key, now);
+    lastFood.set(o.key, o.food);
+    if (o.hasNick && !greeted.has(o.key) && !o.otherTab) { greeted.add(o.key); ownerSay(rnd([`Dạ ${o.nick} tới chơi hả, uống gì nè?`,`Chèn ơi ${o.nick} tới rồi, ngồi đi nghen!`])); pushChat({kind:"sys", text:`${o.nick} vừa ghé quán.`}); }
+  }
+  settleNpcs(); renderPeople(); renderSeatSelect(); updateConn();
+}
+function updateConn(){
+  const el = $("conn");
+  if (room && room.connected()) {
+    const n = others.filter(o=>!o.otherTab).length;
+    el.dataset.state = "on";
+    el.textContent = n ? `Đang có ${n} người thật khác trong quán` : "Quán đang mở, chưa ai khác ghé";
+  } else if (room) { el.dataset.state = "wait"; el.textContent = "Đang kết nối lại…"; }
+  else { el.dataset.state = "off"; el.textContent = "Chỉ mình bạn thấy quán"; }
+}
+const hasClaude = () => !!(window.claude && window.claude.use);
+(async () => {
+  try { room = hasClaude() ? await window.claude.use("room") : null; } catch(e){ room = null; }
+  if (!room) { updateConn(); return; }
+  room.onPeers(ch => onPeers(ch.peers), () => { room = null; others = []; updateConn(); renderPeople(); });
+  room.onConnection(() => updateConn(), () => {});
+  sendPresence(); updateConn();
+  if (window.QC_SYNC) window.QC_SYNC.onTv(applyTvState);
+  if (SHARED()) startSharedNpcs();
+})();
+
+// ---------- AI ----------
+let samplePromise = null, aiOff = false;
+function getSample(){ if (!samplePromise) samplePromise = hasClaude() ? window.claude.use("sample").catch(()=>null) : Promise.resolve(null); return samplePromise; }
+getSample();
+const AI_NAME = window.QC_AI_NAME || "Claude";
+const AI_ERR = {
+  not_granted: "bạn chưa cho phép trang dùng " + AI_NAME, timeout: AI_NAME + " trả lời chậm quá", rate_limited: "đang hết lượt hỏi, chờ một lát",
+  sampling_disabled: "tính năng hỏi " + AI_NAME + " đang tắt ở tài khoản này", capability_disabled: "tính năng hỏi " + AI_NAME + " đang tắt", session_expired: "phiên đăng nhập hết hạn, tải lại trang",
+  upstream_error: AI_NAME + " đang lỗi tạm thời", queue_overflow: "đang quá nhiều câu hỏi cùng lúc", not_declared: "trang chưa bật quyền hỏi " + AI_NAME, unavailable: "chỗ bạn đang mở trang không hỗ trợ hỏi " + AI_NAME,
+};
+function setAiStatus(ok, code){
+  const el = $("aiStat"), fix = $("aiFix"); el.parentElement.dataset.ok = ok ? "1" : "0";
+  if (ok) { el.textContent = `Khách AI: đang trả lời bằng ${AI_NAME}`; fix.hidden = true; return; }
+  el.textContent = `Khách AI đang nói câu soạn sẵn vì ${AI_ERR[code] || (AI_NAME + " chưa trả lời được (" + code + ")")}.`;
+  fix.hidden = !(code === "not_granted" || code === "unavailable" || code === "timeout");
+}
+(async () => {
+  const smp = await getSample();
+  if (!smp) { setAiStatus(false, "unavailable"); return; }
+  try { const perms = hasClaude() && await window.claude.use("permissions"); const st = perms ? await perms.state("sample") : "granted";
+    if (st === "denied") setAiStatus(false, "not_granted");
+    else if (st === "unavailable") setAiStatus(false, "unavailable");
+    else { $("aiStat").textContent = st === "prompt" ? `Khách AI: lần đầu bạn chat, ${AI_NAME} sẽ hỏi cho phép, bấm đồng ý nha.` : `Khách AI: sẵn sàng (${AI_NAME}).`; }
+  } catch(e) { $("aiStat").textContent = `Khách AI: sẵn sàng (${AI_NAME}).`; }
+})();
+$("aiFix").addEventListener("click", async () => {
+  aiOff = false;
+  try { const perms = await window.claude.use("permissions"); if (perms) { const r = await perms.request(["sample"]); const st = r && r.sample;
+      if (st === "denied") { try { await perms.manage(); } catch(e){} } } } catch(e){}
+  $("aiStat").textContent = "Khách AI: thử lại rồi đó, chat một câu xem.";
+});
+
+// ---------- owner ----------
+const owner = { msg:"", at:0 };
+function ownerSay(t, log){ owner.msg = t; owner.at = Date.now(); speak(t, 1.45); if (log) pushChat({who:"Cô Ba bán nước", text:t, kind:"owner"}); }
+
+// ---------- NPCs ----------
+const PERSONAS = {
+  "anh Tư": { g:"m", of:"baloi", w:10, sg:true, region:"Sài Gòn gốc",
+    desc:"chạy xe ôm 20 năm, ở trần mặc áo ba lỗ, rành từng con hẻm",
+    quirks:"nói chậm, hay mở đầu bằng 'hồi đó', gọi đứa nhỏ hơn là 'mày' hoặc 'nhỏ', cười khà khà",
+    ex:["hồi đó mưa vầy là tao chạy trúng mánh","khà khà, nhỏ này lanh ghê","ngập Thảo Điền rồi chứ gì nữa","tao chạy xe hai chục năm, chưa thấy năm nào mưa dai vầy","giờ tụi nhỏ đặt xe bằng app hết, tao ngồi chơi","hồi đó cà phê có 2 ngàn một ly à nha","Nguyễn Hữu Cảnh mưa là thành sông, khỏi nói","xăng lên xuống hoài tao chóng mặt","tao chở khách ra sân bay mà kẹt cứng một tiếng","nhỏ kia uống bạc xỉu hoài, bữa nào thử đen đá coi"], re:["ờ","khà khà","vậy hả","kệ nó đi mày","hồi đó cũng vậy"] },
+  "Long": { g:"m", of:"baloi", w:9, sg:true, region:"Sài Gòn",
+    desc:"thợ hồ, áo ba lỗ quần đùi, thật thà",
+    quirks:"nói thẳng ruột ngựa, hay cười 'hề hề', hay rủ ăn",
+    ex:["hề hề tao đâu biết gì đâu","trà đá nè, tao bao","mai đổ bê tông mà mưa vầy chết tao","công trình nghỉ ba bữa rồi, hết tiền xài","tao ăn hai gói mì rồi mà còn đói","bữa nay chủ thầu phát lương sớm, vui","đi đám cưới tháng này ba đám rồi, cháy túi","nhà tao dột quá trời, về chắc lấy thau hứng"], re:["hề hề","ờ ha","thiệt hông","ăn hông tao kêu"] },
+  "Minh": { g:"m", of:"somi", w:9, sg:true, region:"Sài Gòn",
+    desc:"dân IT 28 tuổi bị tăng ca, sơ mi bỏ thùng",
+    quirks:"chen chữ Anh kiểu dân văn phòng: deadline, OT, meeting, ping, sếp, release; than mệt",
+    ex:["OT tới giờ mới về má ơi","sếp ping tao lúc 11h đêm nè","mai 8h có meeting, thôi kệ","công ty mới cho xài AI viết code, tao thất nghiệp tới nơi","release cuối năm mà bug quá trời","nghe đồn hôm nay có con chip bảo mật made in Việt Nam ra mắt đó","thưởng Tết năm nay chắc được cái bánh chưng","laptop tao sập nguồn giữa meeting, tới công chuyện luôn"], re:["ờ","chán thiệt","để mai tính","thôi kệ đi"] },
+  "Ngọc": { g:"f", of:"dobo", w:9, sg:true, region:"Sài Gòn",
+    desc:"bán quần áo online, mặc đồ bộ bông",
+    quirks:"nói nhanh, hay 'trời ơi', 'bà nội', than bị bom hàng, hay nói chuyện livestream bán hàng",
+    ex:["trời ơi lại bom ba đơn nữa nè","bà nội ơi mai live tiếp mệt muốn xỉu","đồ bộ này bán 79k nha mấy bà","11.11 sắp tới rồi, tao gom hàng muốn sập phòng","khách hỏi giá rồi seen, quen rồi","mưa vầy shipper hông lấy hàng, chết tao","live hôm qua có 3 người xem, 2 người là má với em tao","Black Friday cuối tháng mà kho chưa có hàng"], re:["trời ơi","thiệt hả","bà nội","ủa gì z"] },
+  "chị Hạnh": { g:"f", of:"dobo", w:8, sg:true, region:"Sài Gòn",
+    desc:"chủ tiệm gội đầu kế bên, đồ bộ, xởi lởi",
+    quirks:"gọi người nhỏ hơn là 'em' hoặc 'cưng', tò mò chuyện người ta, hay mời qua tiệm, hay nói chuyện giá vàng",
+    ex:["ủa em có bồ chưa","mai qua chị gội cho, chị bớt","cưng ăn gì chưa","vàng lên nữa rồi, hồi đó hông mua tiếc ghê","tháng này chị đi đám cưới mà muốn hết vốn","mưa vầy hông ai đi gội, chị đóng cửa sớm","20/11 sắp tới, chị phải lo quà cho cô giáo thằng nhỏ","em gái nhìn mệt ghê, qua chị massage đầu cho"], re:["vậy hả em","trời","thôi cưng","ăn chưa em"] },
+  "Khoa": { g:"m", of:"shipper", w:9, sg:true, region:"Sài Gòn",
+    desc:"shipper vừa giao đơn cuối, ướt nhẹp",
+    quirks:"cộc lốc, mệt, hay kể đơn hàng trời ơi đất hỡi",
+    ex:["đơn cuối giao lên lầu 5 hông thang máy","ướt như chuột lột nè","khách bom, đứng mưa nửa tiếng","sắp 11.11 là tụi tao chạy sấp mặt","lội nước tới đầu gối mới giao được ly trà sữa","app tính phí mưa có thêm 5 ngàn, cảm động ghê","khách ghi chú 'giao lẹ nha em' trong khi đường ngập"], re:["ờ","mệt","ừa","kệ"] },
+  "Bin": { g:"m", of:"hocsinh", w:8, sg:true, region:"Sài Gòn",
+    desc:"sinh viên năm nhất, lười giặt đồ nên mặc lại áo đồng phục cấp 3",
+    quirks:"teencode: j, z, ko, k, ns, cx, :)), hay chêm câu trend mạng, hay bị chọc nên cãi lại",
+    ex:["ủa j z mấy a","mặc áo này mát mà :))","ns hoài ns hoài","dự án ma của e là dậy sớm :))","e đang farm aura mà mưa ướt hết","công chúa phòng trọ là e nè, hết tiền r","20/11 lớp e góp quỹ mua hoa mà e chưa đóng","đúng nhận sai cãi, e cãi :))"], re:["j z","ủa","ok","kkk","xin phép được bất lực"] },
+  "Bảo": { g:"m", of:"thun", w:7, sg:true, region:"Sài Gòn",
+    desc:"streamer game ít view",
+    quirks:"nói sảng, khoe view, gọi mọi người là 'anh em', 'cả nhà', hay nói 'bá khí'",
+    ex:["tối qua stream có 12 người xem đó anh em","sắp nổi rồi, tin tui đi","anh em nhấn follow giùm cái","tui mới quay clip trend 'hồi chiều trời mưa', 200 view rồi","bá khí chưa, ngồi quán cóc mà như CEO","mai tui live ngồi đây luôn, tên kênh là quán cóc","AI giờ làm clip còn hay hơn tui nữa, buồn"], re:["ez","chuẩn","sắp nổi rồi","gg","bá khí"] },
+  "Thảo": { g:"f", of:"thun", w:8, sg:true, region:"Sài Gòn",
+    desc:"sinh viên năm cuối chạy deadline luận văn",
+    quirks:"than deadline, mỏ hỗn, cà khịa đứa sến, hay 'thôi đi cha nội'",
+    ex:["luận văn chưa viết chữ nào nè","thôi đi cha nội","mai nộp bài mà giờ ngồi đây","tiền trọ lên thêm 300 nữa, tới công chuyện","tui ổn, chỉ là hơi hông ổn","thầy hướng dẫn seen tin nhắn từ thứ hai","ra trường xong chắc đi bán cà phê với cô Ba"], re:["thôi đi","ờ","xỉu","ủa","ai mượn"] },
+  "Vy": { g:"f", of:"somi", w:9, region:"miền Tây (Cần Thơ)",
+    desc:"nhân viên văn phòng mới lên Sài Gòn",
+    quirks:"giọng miền Tây: xưng 'tui', 'hông', 'dzậy', 'nghen', 'dữ thần', 'quá trời quá đất', 'chèn ơi', 'mấy cha', 'hen'",
+    ex:["chèn ơi mưa gì dữ thần dzậy","tui nhớ nhà quá trời nè","mấy cha ăn hông, tui kêu thêm nghen","ở dưới quê giờ này ăn lẩu mắm là hết sảy","má tui gọi hỏi ăn cơm chưa, tui nói ăn rồi mà ăn mì","Tết này tui về quê sớm, nhớ má quá","nghe nói cuối năm dưới miền Tây hạn mặn sớm, lo ghê"], re:["dzậy hả","chèn ơi","thiệt hông nè","hen","trời đất"] },
+  "Duy": { g:"m", of:"thun", w:7, region:"miền Tây (Bến Tre)",
+    desc:"đánh đàn ở quán nhậu, vừa tan ca, hơi sến",
+    quirks:"giọng miền Tây, sến súa, hay hát bậy một câu bolero, 'bậu', 'qua', 'nghen'",
+    ex:["mưa vầy hát bolero là hết sảy nghen","qua mới tan ca nè","bậu ơi đừng giận qua","mùa cưới qua đàn ba đám một tuần, mỏi tay","nghe tiếng mưa là muốn ôm đàn liền","đêm nay mưa rơi nhớ người thương quá chừng"], re:["dzậy hả","hen","ờ nghen","thôi kệ"] },
+  "O Hà": { g:"f", of:"thun", w:6, region:"miền Trung (Huế)",
+    desc:"làm spa, quê Huế, vô Sài Gòn 3 năm",
+    quirks:"giọng Huế: 'tau', 'mi', 'răng', 'rứa', 'chi', 'ni', 'mô', 'tê', 'hỉ', 'hè'",
+    ex:["mưa chi mà mưa rứa hè","răng mi chưa về","ở ngoài Huế mưa còn dữ hơn ni","tháng ni ngoài nhà tau lụt rồi đó","nhớ bún bò ngoài nớ quá hỉ","mạ tau gọi hỏi trong ni có lụt không"], re:["rứa hả","răng rứa","ừ hỉ","chi rứa"] },
+  "Dũng": { g:"m", of:"baloi", w:6, region:"miền Trung (Quảng Nam)",
+    desc:"thợ điện, quê Quảng Nam",
+    quirks:"giọng Quảng: 'tui', 'mi', 'răng', 'rứa', 'chừ', 'nì', 'hấy', 'ngó', nói thẳng",
+    ex:["chừ mưa ri răng mà về","dây điện ngoài tê rối như tơ vò nì","mì Quảng chỗ ni hông có hấy","mưa chừ mà chập điện là tui đi sửa liền","ngoài quê tui mưa lụt tới mái nhà rồi đó","ngó cái cột điện kia tui thấy ớn"], re:["rứa hả","chừ răng","ờ","thiệt hấy"] },
+  "Tuấn": { g:"m", of:"somi", w:6, region:"miền Bắc (Hà Nội)",
+    desc:"đi công tác Sài Gòn, dân Hà Nội",
+    quirks:"giọng Bắc: 'bọn mày', 'thế', 'đấy', 'nhỉ', 'à', 'chả', 'giời ạ', 'ơ', 'vãi', ngạc nhiên vì văn hóa Sài Gòn",
+    ex:["giời ạ mưa gì như trút thế","trong này gọi trà đá miễn phí à, sướng thế","ơ thế bọn mày ngồi đến mấy giờ","ngoài Hà Nội không khí lạnh về rồi, trong này vẫn mặc cộc","vợ tao nhắn ngoài kia lạnh phải đắp chăn rồi đấy","sáng mai bay ra rồi, chả muốn về tí nào","cà phê trong này ngọt thế nhỉ"], re:["thế à","ơ","giời ạ","chả biết"] },
+  "Mike": { g:"m", of:"thun", w:2, region:"người Úc, khách du lịch balo",
+    desc:"khách Tây ba lô đang ở Bùi Viện",
+    quirks:"tiếng Việt bập bẹ trộn tiếng Anh, sai dấu, khen đồ ăn, hỏi chữ",
+    ex:["oh my god mưa quá lớn","cà phê sữa đá number one!","tui... hông hiểu, chậm chậm please","what is 'tới công chuyện'?","motorbike in water, crazy!","tui học chữ mới: 'xỉu' haha"], re:["haha yes yes","sorry, hông hiểu","wow","ok ok"] },
+  "Sophie": { g:"f", of:"somi", w:2, region:"người Pháp, đi du lịch",
+    desc:"khách Pháp mê bánh mì Sài Gòn",
+    quirks:"tiếng Việt bập bẹ, chen 'oh là là', 'merci', so sánh với Paris",
+    ex:["oh là là bánh mì ngon hơn Paris","merci cô Ba","mưa ở đây ấm, hông lạnh như Paris","tui thích ghế nhỏ nhỏ này, very cute","người ta ngồi trên đường uống cà phê, j'adore"], re:["oh là là","merci","haha oui","hông hiểu nhưng vui"] },
+};
+const NPC_NAMES = Object.keys(PERSONAS);
+// things anyone from Sài Gòn might bring up these days
+const TOPIC_LINES = [
+  "11.11 sắp tới, giỏ hàng Shopee của tao đầy rồi mà ví thì hông",
+  "tháng này mùa cưới, thiệp hồng bay như lá mùa thu",
+  "đám cưới giờ mừng 500 mà còn ngại",
+  "20/11 tới nơi rồi, mấy đứa còn đi học lo quà cô chưa",
+  "nghe nói ngoài Bắc lạnh rồi, trong này vẫn nóng hầm mưa ào",
+  "dự báo tháng này Nam Bộ còn mưa to á, chưa hết đâu",
+  "cuối năm mà mưa vầy, tưởng mùa khô tới rồi chứ",
+  "nghe đâu cuối năm El Nino, mùa khô tới sớm",
+  "vàng lên xuống như tâm trạng tao",
+  "tiền trọ lên nữa rồi tụi bây ơi",
+  "thưởng Tết năm nay đừng là bánh chưng nha",
+  "giờ cái gì cũng AI, mai mốt AI ngồi quán cóc luôn",
+  "nghe nói Việt Nam mới làm được con chip bảo mật riêng, ghê ha",
+  "Halloween mới qua mà Noel đã treo đèn rồi",
+  "Black Friday cuối tháng, đứa nào săn sale đồ điện tử chỉ tao",
+  "giờ tan tầm qua vòng xoay Hàng Xanh là tới công chuyện",
+  "mỗi lần mưa là app gọi xe tăng giá gấp đôi",
+  "tao ổn, chỉ là hơi hông ổn",
+  "hồi chiều trời mưa, rồi tới giờ vẫn mưa",
+  "dự án ma của tao năm nay là tập gym",
+  "ai mượn mày ra đây ngồi giờ này dị",
+  "nói ít hiểu nhiều, kêu thêm ly nữa đi",
+  "xin phép được bất lực với cái thời tiết này",
+  "ủa alo, ai kêu dĩa hướng dương mà chưa ăn",
+  "đúng nhận sai cãi, mà tao chưa sai bao giờ",
+  "mấy đứa farm aura ngoài mưa kìa, ướt hết rồi",
+  "công chúa phòng trọ cuối tháng ăn mì gói thôi",
+  "tới công chuyện rồi, xe tao để ngoài mưa",
+  "mưa vầy nằm nhà ngủ cho sướng mà khùng khùng ra đây",
+  "tối nay tao ngồi lì tới sáng luôn",
+  "mì gói 2 trứng giờ này là chân ái",
+  "đứa nào ăn hướng dương hông, tao bao nè",
+  "xe cá viên chạy qua mà ví tao xẹp lép",
+  "ủa mấy giờ rồi mà còn ngồi đây hết dị",
+  "Ba ơi cho thêm cục đá nghen",
+  "mai thứ hai thứ ba gì cũng mệt như nhau",
+  "điện thoại tao còn 3% pin mà hông ai có sạc",
+  "cuối năm deadline dí như chó dí",
+  "hồi chiều kẹt xe ở cầu Sài Gòn muốn xỉu",
+  "quán này wifi mạnh hơn nhà tao",
+  "cuộc đời cho tao quả chanh, tao đi kiếm muối ớt",
+  "người ta có đôi có cặp, tao có trà đá với wifi",
+];
+const STORM_LINES = ["trời đất ơi mưa gì như trút nước dị","ê sấm to quá giật cả mình","chết, xe tao để ngoài kia","mưa vầy về sao nổi trời","cô Ba ơi kéo bạt xuống xíu đi cô","sét đánh gần ghê, rút sạc điện thoại ra lẹ","sấm kiểu này tao hồi hộp hơn đi phỏng vấn","giông tới thiệt rồi, ngồi sát vô trong đi"];
+const HEAVY_LINES = ["mưa nặng hạt rồi kìa","trắng xóa luôn rồi, hông thấy đường","cái bạt chịu hông nổi nữa á","tạt vô ướt hết ống quần rồi","mưa to vầy chắc lát ngập"];
+const CALM_LINES = ["mưa nhỏ rồi kìa, mà thôi ngồi thêm xíu","hết giông rồi mà lười về ghê","tạnh bớt rồi, đứa nào về trước đi","lâm râm vầy ngồi tám là chuẩn bài","nhẹ hạt rồi, mát ghê"];
+const FLOOD_LINES = ["ngập rồi kìa tụi bây","ngập tới bánh xe luôn rồi","xe kia chết máy giữa đường kìa","lội nước về chắc rớt dép","mai chắc phải bơi đi làm","ai có áo mưa bộ cho mượn","nước tràn lên lề rồi, co chân lên"];
+const NPC_PAIRS = [
+  [["Long","cái áo đồng phục đó mày mặc mấy năm rồi Bin"],["Bin","kệ e, áo này mặc mát :))"]],
+  [["anh Tư","hồi đó tao chạy xe ôm mưa vầy là trúng mánh"],["Khoa","giờ app hết rồi anh Tư, mánh đâu nữa"]],
+  [["Ngọc","trời ơi lại bị bom ba đơn nữa nè"],["chị Hạnh","thôi bỏ đi em, uống miếng trà đá cho hạ hỏa"]],
+  [["Tuấn","ơ trà đá trong này không mất tiền à"],["Vy","miễn phí đó anh, uống cho đã đi nghen"]],
+  [["O Hà","mưa chi mà mưa rứa hè"],["Dũng","ngoài mình còn dữ hơn ni, chừ ăn thua chi"]],
+  [["Mike","cô Ba, one more cà phê sữa đá please"],["anh Tư","thằng Tây này ghiền rồi khà khà"]],
+  [["Duy","mưa vầy mà có người ngồi kế bên là hết bài nghen"],["Thảo","thôi đi cha nội, sến quá trời"]],
+  [["Minh","sếp ping tao lúc 11h đêm nè"],["Bảo","block luôn đi anh, sợ gì"]],
+  [["Ngọc","11.11 tới rồi, ai mua đồ bộ ủng hộ tao hông"],["Long","hề hề mua cho tao một bộ size bự nhất"]],
+  [["chị Hạnh","tháng này chị đi năm đám cưới rồi đó"],["Duy","qua đàn ở bốn đám trong đó nè chị"]],
+  [["Tuấn","ngoài Hà Nội rét rồi đấy, bọn mày sướng thế"],["anh Tư","trong này chỉ có hai mùa, mưa với mưa nữa"]],
+  [["Minh","nghe nói có chip bảo mật made in Việt Nam rồi đó"],["Bảo","vậy mai mốt máy chơi game made in Việt Nam luôn hông anh"]],
+  [["Thảo","tiền trọ lên 300 nữa nè"],["Vy","chèn ơi, tui cũng bị lên nè, buồn dữ thần"]],
+  [["Bin","20/11 lớp e góp 50k mua hoa"],["chị Hạnh","rồi đóng chưa cưng"]],
+  [["Khoa","sắp sale 11.11 là tao chạy sấp mặt"],["Ngọc","chạy giùm tao mấy đơn nha Khoa"]],
+  [["Sophie","bánh mì ở đây, very good"],["Long","hề hề, ăn thêm ổ nữa đi tao bao"]],
+  [["Dũng","dây điện ngoài tê rối như tơ vò nì"],["Minh","vậy mà wifi vẫn mạnh, hay ghê"]],
+  [["Bảo","tui mới làm clip trend 'hồi chiều trời mưa'"],["Thảo","ai mượn, giờ vẫn còn mưa nè"]],
+];
+const MOODS = ["đang vui, hơi lầy","mệt rã rời","buồn ngủ díp mắt","hơi quạu vì mưa","đang đói","hứng chí muốn kể chuyện","đang nhớ nhà","bình thường, ngồi chill"];
+const TOPICS = [
+  "11.11 sắp tới, ai cũng săn sale Shopee, TikTok Shop",
+  "đang mùa cưới cuối năm, đi đám cưới liên tục cháy túi",
+  "20/11 ngày nhà giáo sắp tới, lo quà cho thầy cô",
+  "ngoài miền Bắc không khí lạnh tràn về, Hà Nội trở lạnh, trong Sài Gòn vẫn mưa",
+  "dự báo tháng 11 Nam Bộ vẫn còn mưa to",
+  "cuối năm có thể El Nino, miền Tây lo hạn mặn, mùa khô tới sớm",
+  "chip bảo mật đầu tiên do Việt Nam tự thiết kế vừa được giới thiệu",
+  "giá vàng lên xuống thất thường",
+  "tiền trọ tăng, giá cả cái gì cũng lên",
+  "thưởng Tết cuối năm, deadline cuối năm",
+  "AI làm được đủ thứ, người ta lo mất việc",
+  "Black Friday cuối tháng 11",
+  "kẹt xe giờ tan tầm, gọi xe trời mưa bị tăng giá",
+  "Halloween vừa qua, trung tâm thương mại đã treo đèn Noel",
+];
+const TRENDS = ["hồi chiều trời mưa","tới công chuyện rồi","ủa rồi ai mượn","xin phép được bất lực","đúng nhận sai cãi","nói ít hiểu nhiều","tui ổn, chỉ là hơi hông ổn","dự án ma","công chúa phòng trọ","mỏ hỗn","farm aura","bá khí","ủa alo","dạ gỗ xà cừ ạ","cái gì vậy trời"];
+const recentLines = [];
+function remember(l){ recentLines.push(l); if (recentLines.length > 70) recentLines.shift(); }
+function fresh(pool){ const c = pool.filter(l => !recentLines.includes(l)); return rnd(c.length ? c : pool); }
+function linesFor(n){ const P = PERSONAS[n.nick]; return P.sg ? P.ex.concat(TOPIC_LINES) : P.ex; }
+function shuffle(a){ const b = a.slice(); for (let i=b.length-1;i>0;i--){ const j = Math.floor(Math.random()*(i+1)); [b[i],b[j]] = [b[j],b[i]]; } return b; }
+let npcs = [], simOn = true;
+function realSeats(){ const s = new Set(); if (me.seat !== null) s.add(me.seat); for (const o of others) if (o.seat !== null) s.add(o.seat); return s; }
+function freeSeats(){ const used = realSeats(); for (const n of npcs) used.add(n.seat); return SEATS.map((_,i)=>i).filter(i=>!used.has(i)); }
+function pickName(used){ const pool = NPC_NAMES.filter(n=>!used.has(n)); let tot = pool.reduce((a,n)=>a+PERSONAS[n].w,0), r = Math.random()*tot; for (const n of pool){ if ((r -= PERSONAS[n].w) < 0) return n; } return pool[0]; }
+function addNpc(quiet, forceName){
+  const f = freeSeats(); if (!f.length) return null;
+  const used = new Set(npcs.map(n=>n.nick));
+  const nick = forceName && !used.has(forceName) ? forceName : pickName(used); if (!nick) return null;
+  const map0 = occupants().map, lone = f.filter(i => !map0.has(mateOf(i)));
+  const seat0 = rnd(lone.length ? lone : f);
+  const n = { key:"npc-"+Math.random().toString(36).slice(2,7), nick, g: PERSONAS[nick].g, outfit: PERSONAS[nick].of, seat:seat0, drink:null, food:null, hue:Math.floor(Math.random()*360), msg:"", msgAt:0, servedAt:0, foodAt:0, act:"", actAt:0, sim:true };
+  npcs.push(n);
+  if (!quiet) { pushChat({kind:"sys", text:`${nick} (AI) vừa tấp vô quán.`}); doAct(n, "vay");
+    const mate = map0.get(mateOf(seat0));
+    if (mate && mate.real) setTimeout(() => { if (npcs.includes(n)) npcSay(n, rnd([`${mate.nick} ơi, cho tui ngồi chung bàn nha?`,`xin phép ngồi ké bàn ${mate.nick} xíu nghen`,`hết bàn rồi, ${mate.nick} cho ngồi chung hông?`])); }, 1500); }
+  setTimeout(()=>{ if (npcs.includes(n)) { n.drink = rnd(Object.keys(DRINKS)); n.servedAt = Date.now(); renderPeople(); } }, 1800 + Math.random()*2500);
+  return n;
+}
+function settleNpcs(){
+  const rs = realSeats();
+  for (const n of [...npcs]) {
+    if (rs.has(n.seat)) { const f = freeSeats().filter(i=>!rs.has(i)); if (f.length) n.seat = rnd(f); else npcs = npcs.filter(x=>x!==n); }
+  }
+}
+function npcSay(n, text){
+  if (SHARED()) { window.QC_SYNC.sayNpc(n.nick, text); return; }
+  n.msg = text; n.msgAt = Date.now(); remember(text); pushChat({who:n.nick, text, kind:"ai", hue:n.hue});
+  autoActFromText(n, text);
+  if (Math.random() < .25 && npcs.length > 1) { const m = rnd(npcs.filter(x=>x!==n)); if (m) setTimeout(()=>doAct(m, "cuoi"), 700); }
+}
+function seedNpcs(){
+  npcs = [];
+  for (const nm of ["anh Tư","Ngọc","Bin","Vy","Tuấn"]) addNpc(true, nm);
+  const ks = Object.keys(DRINKS), fs = Object.keys(FOODS);
+  npcs.forEach((n,i)=>{ n.drink = ks[(i*2+1)%ks.length]; if (i%2===0) n.food = fs[i%fs.length]; });
+  if (npcs[0]) npcSay(npcs[0], fresh(linesFor(npcs[0])));
+}
+let pairBusy = false; const recentPairs = [];
+setInterval(()=>{
+  if (!simOn || document.hidden || typing.size || pairBusy || !isLeader()) return;
+  const r = Math.random();
+  const pair = NPC_PAIRS.filter((p,i) => !recentPairs.includes(i) && p.every(([nm]) => npcs.some(n=>n.nick===nm)));
+  if (r < .3 && pair.length) {
+    const pk = rnd(pair); recentPairs.push(NPC_PAIRS.indexOf(pk)); if (recentPairs.length > 10) recentPairs.shift();
+    const [[a,la],[b,lb]] = pk; pairBusy = true;
+    npcSay(npcs.find(n=>n.nick===a), la);
+    setTimeout(()=>{ const nb = npcs.find(n=>n.nick===b); if (nb) npcSay(nb, lb); pairBusy = false; }, 2500 + Math.random()*1500);
+  }
+  else if (r < .55 && npcs.length) { const n = rnd(npcs); npcSay(n, fresh(linesFor(n))); }
+  else if (r < .68 && npcs.length < 7) { addNpc(); }
+  else if (r < .78 && npcs.length > 3) { const n = npcs.splice(Math.floor(Math.random()*npcs.length),1)[0]; pushChat({kind:"sys", text:`${n.nick} (AI) trả tiền rồi chạy về.`}); }
+  else if (npcs.length) { const n = rnd(npcs); if (Math.random()<.5){ n.food = rnd(Object.keys(FOODS)); n.foodAt = Date.now(); } else { n.drink = rnd(Object.keys(DRINKS)); n.servedAt = Date.now(); } ownerSay(rnd(["Có liền nghen!","Đợi em xíu nghen!","Dạ nè, của anh nè!","Ra liền liền nè!"])); }
+  renderPeople();
+}, 14000);
+function weatherTalk(st, up){
+  if (!simOn || !npcs.length) return;
+  const pool = up ? (st === "giong" ? STORM_LINES : st === "to" ? HEAVY_LINES : null) : (st === "lam" ? CALM_LINES : null);
+  if (st === "giong" && up) ownerSay("Chèn ơi mưa dữ thần, mấy anh chị dô sâu trong này ngồi nè, tạt ướt hết trơn!", true);
+  if (pool && isLeader()) setTimeout(()=>{ if (npcs.length) npcSay(rnd(npcs), fresh(pool)); }, 2000 + Math.random()*2000);
+}
+function floodTalk(){ if (simOn && npcs.length && isLeader()) setTimeout(()=>{ if (npcs.length) npcSay(rnd(npcs), fresh(FLOOD_LINES)); }, 1500 + Math.random()*2000); }
+
+function recentChat(){ return chat.filter(e=>e.kind!=="sys").slice(-12).map(e=>`${e.who}: ${e.text}`).join("\n"); }
+function tidy(t, n){
+  let s = String(t||"").split("\n").map(x=>x.trim()).filter(Boolean)[0] || "";
+  s = s.replace(new RegExp("^\\**"+n.nick.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")+"\\**\\s*:\\s*","i"),"").replace(/^["“”'\s]+|["“”'\s]+$/g,"").replace(/\.$/,"");
+  if (!/^(Mike|Sophie)$/.test(n.nick) && s.length > 1 && /^[A-ZÀ-Ỹ]/.test(s) && !/^[A-Z]{2}/.test(s)) s = s[0].toLowerCase() + s.slice(1);
+  return clean(s, 90);
+}
+const WEATHER_TXT = { lam:"mưa lâm râm", vua:"mưa vừa", to:"mưa to trắng xóa", giong:"mưa giông, sấm chớp đùng đùng" };
+async function npcSpeak(n, task, fallback){
+  const P = PERSONAS[n.nick];
+  typing.add(n.nick); renderChat();
+  const t0 = Date.now();
+  let reply = "";
+  const sample = aiOff ? null : await getSample();
+  if (!sample && !aiOff) setAiStatus(false, "unavailable");
+  if (sample) {
+    const weather = (WEATHER_TXT[W.stage] || "trời mưa") + (W.flood > .15 ? ", đường đang ngập nước" : "");
+    const mine = chat.filter(e=>e.who===n.nick && e.kind==="ai").slice(-6).map(e=>`"${e.text}"`).join(", ") || "(chưa nói gì)";
+    const prompt =
+`Mày đóng vai ${n.nick}: ${P.desc}. Quê/giọng: ${P.region}.
+Cách nói riêng của ${n.nick}: ${P.quirks}.
+Vài câu ${n.nick} hay nói, chỉ để bắt giọng, CẤM chép lại: "${shuffle(P.ex).slice(0,3).join('" / "')}"
+Tâm trạng lúc này: ${rnd(MOODS)}.
+
+Bối cảnh: khuya, ${weather}, quán cà phê cóc vỉa hè Sài Gòn, ngồi ghế đẩu, cô Ba bán nước. Mọi người tám chuyện như quen lâu.
+Chuyện người ta đang bàn tán dạo này (chỉ lôi vào nếu hợp mạch, đừng nhồi): ${shuffle(TOPICS).slice(0,3).join("; ")}.
+Câu cửa miệng đang trend trên mạng (lâu lâu chêm một câu nếu hợp, đừng lần nào cũng dùng): ${shuffle(TRENDS).slice(0,4).join(", ")}.
+
+Luật để nghe như người thật chứ không như AI:
+- Nói như nói miệng ngoài đời: viết thường, ngắn, có khi cụt ngủn 1-3 chữ, không chấm câu cuối.
+- Đừng cố tỏ ra hài hay thông minh, không chơi chữ, không khuyên răn, không lặp lại hay tóm tắt câu người ta vừa nói, đừng lúc nào cũng hỏi ngược lại.
+- Được trả lời lệch đề, kể chuyện của mình, than thở, hay chỉ "ờ", "thiệt hông".
+- Thân, không khách sáo: không dùng "bạn", "mình", "ạ", "dạ" (trừ khách nước ngoài nói bập bẹ).
+- Giữ đúng giọng vùng miền ở trên.
+- Không chửi tục nặng, không xúc phạm ai, không bàn chính trị.
+- Bị hỏi thẳng có phải AI không thì nhận kiểu giỡn.
+- Những câu ${n.nick} đã nói rồi, CẤM lặp lại hay na ná: ${mine}
+
+Chat gần đây trong quán:
+${recentChat()}
+
+${task}
+Viết đúng câu ${n.nick} nói, một dòng, tối đa 18 chữ, không ghi tên.`;
+    try { const r = await Promise.race([ sample(prompt, { modelTier:"quick", cache:false }), new Promise((_, rej) => setTimeout(() => rej({ code:"timeout" }), 15000)) ]); reply = tidy(r.text, n); }
+    catch(e) { const code = (e && e.code) || "upstream_error"; setAiStatus(false, code); if (code === "not_granted") aiOff = true; }
+    if (reply) setAiStatus(true);
+  }
+  if (!reply) reply = fresh(fallback || P.re.concat(linesFor(n)));
+  const typeTime = 700 + reply.length*45 + Math.random()*800;
+  const wait = typeTime - (Date.now()-t0);
+  if (wait > 0) await new Promise(r=>setTimeout(r, wait));
+  typing.delete(n.nick);
+  const cur = npcs.find(x => x.nick === n.nick);
+  if (cur) npcSay(cur, reply); else renderChat();
+  return reply;
+}
+// ---- scripted replies that still answer what was asked (used when no AI is available) ----
+const AGE = { "anh Tư":"tao 52 rồi mày", "Long":"34 nè", "Minh":"28, già rồi", "Ngọc":"hỏi tuổi con gái chi z", "chị Hạnh":"chị 39 cưng", "Khoa":"25 nè", "Bin":"e 18 :))", "Bảo":"23, tuổi trẻ tài cao", "Thảo":"22, sắp ra trường", "Vy":"tui 24 nè", "Duy":"qua 30 rồi bậu", "O Hà":"tau 27 hỉ", "Dũng":"tui 31 rứa", "Tuấn":"tao 35", "Mike":"twenty nine, hai chín haha", "Sophie":"vingt-six, hai sáu" };
+const PRON = { "Vy":"tui", "Duy":"qua", "O Hà":"tau", "Dũng":"tui", "Mike":"tui", "Sophie":"tui", "chị Hạnh":"chị", "Bin":"e", "Bảo":"tui", "Thảo":"tui" };
+function scriptedReply(n, text){ const r = scriptedReply0(n, text), p = PRON[n.nick]; return p ? r.replace(/(^|\s)tao(?=\s|$)/g, "$1" + p) : r; }
+function scriptedReply0(n, text){
+  const P = PERSONAS[n.nick], t = " " + norm(text).replace(/[^a-z0-9?]+/g," ").replace(/\?/g," ? ") + " ";
+  const has = (...ws) => ws.some(w => t.includes(" " + w + " "));
+  const job = P.desc.split(",")[0], short = n.nick.split(" ").pop();
+  const drink = n.drink && DRINKS[n.drink] ? DRINKS[n.drink].name.toLowerCase() : "trà đá";
+  const wx = { lam:"mưa lâm râm vầy ngồi tám là chuẩn", vua:"mưa nặng hạt rồi đó", to:"mưa to quá trời luôn", giong:"giông sấm muốn bể màng nhĩ" }[W.stage] || "mưa hoài";
+  if (has("la ai","ai vay","robot","bot","ai a","phai ai")) return rnd(["ờ tao AI nè, mà tao cũng biết đói á","AI mà ngồi quán cóc, lạ hông","tao khách ảo thôi, mà tám thiệt đó"]);
+  if (has("ten gi","ten la gi","ten chi","ten j","ten")) return rnd([`tao là ${short} nè, gọi hoài mà hỏi tên`,`${short} đó, nhớ dùm cái`]);
+  if (has("may tuoi","bao nhieu tuoi","tuoi")) return AGE[n.nick] || "hỏi tuổi chi, già rồi";
+  if (has("lam nghe gi","lam gi","nghe gi","nghe","di lam","cong viec")) return `tao ${job} đó`;
+  if (has("que o dau","que dau","o dau","que")) return `quê tao ${P.region} nè`;
+  if (has("khoe khong","khoe ko","khoe hong","khoe","on khong","sao roi","the nao","lam sao roi","lam sao")) return rnd(["cũng ổn, mệt xíu thôi","khỏe re, còn mày?","tàm tạm, mưa vầy hơi oải","có sao đâu, ngồi uống nước nè"]);
+  if (has("uong gi","an gi","doi","an chua","uong chua","uong","an")) return rnd([`tao đang uống ${drink} nè`,`mới kêu ${drink}, mày uống gì kêu đi`,"đói thì kêu mì gói đi, cô Ba nấu ngon"]);
+  if (has("mua","giong","sam","ngap","troi")) return wx;
+  if (has("buon","chan","met","stress","co don")) return rnd(["thôi uống miếng nước đi, kể tao nghe","ai cũng có lúc vậy, ngồi đây tám cho vui","mệt thì ngồi lì đây luôn, có ai đuổi đâu"]);
+  if (has("haha","hihi","kkk","hehe","lol")) return rnd(["cười gì mày","ha ha khùng ghê","vui dữ ta"]);
+  if (has("cam on","thank","thanks")) return rnd(["có gì đâu","khách sáo chi"]);
+  if (has("tam biet","ve nha","ve day","bye")) return rnd(["về cẩn thận nha, đường trơn","ờ về đi, mai ghé"]);
+  if (has("chao","hello","hi","alo")) return rnd([`ê chào ${myName()}, ngồi đi`,"ờ chào, mới tới hả"]);
+  if (has("?","khong","ko","hong","chua","sao","gi")) return rnd(["hông biết nữa, hỏi cô Ba đi","chắc vậy á","ủa sao hỏi tao","tao cũng hông chắc nữa"]);
+  if (has("oi","e","ne")) return rnd([`ơi, ${myName()} kêu gì`,`gì đó ${myName()}`,"ờ nghe nè"]);
+  return fresh(P.re.concat(P.ex));
+}
+const norm = t => String(t).normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/đ/g,"d").replace(/Đ/g,"d").toLowerCase();
+function namesFor(nick){ const full = norm(nick), parts = full.split(/\s+/), last = parts[parts.length-1]; return last.length >= 2 && last !== full ? [full, last] : [full]; }
+function calledIn(text, nick){ const t = " " + norm(text).replace(/[^a-z0-9]+/g," ") + " "; return namesFor(nick).some(nm => t.includes(" " + nm + " ")); }
+async function aiReply(userText, target){
+  if (!simOn || !npcs.length) return;
+  if (target && npcs.includes(target)) { await npcSpeak(target, `${myName()} đang ngồi chung, nói riêng với ${target.nick}: "${userText}". ${target.nick} trả lời thẳng vào câu đó, tự nhiên như đang tám với nhau.`, [scriptedReply(target, userText)]); return; }
+  // who was called: someone in the café, or someone who is not here tonight
+  const here = npcs.find(x => calledIn(userText, x.nick) && norm(x.nick).includes(" ")) || npcs.find(x => calledIn(userText, x.nick));
+  const away = !here && NPC_NAMES.find(nm => calledIn(userText, nm));
+  if (away) { const m = rnd(npcs); await npcSpeak(m, `${myName()} gọi "${away}" nhưng ${away} hông có ở quán tối nay. ${m.nick} trả lời giùm.`, [`${away} hông có ở đây nha`,`${away} về hồi nãy rồi`,`tối nay hông thấy ${away} ghé`]); return; }
+  const n = here || rnd(npcs);
+  await npcSpeak(n, here ? `${myName()} gọi tên ${n.nick} và nói: "${userText}". ${n.nick} đáp lại ${myName()} liền.` : `${myName()} vừa nói: "${userText}". ${n.nick} đáp lại.`,
+    [scriptedReply(n, userText)]);
+  if (npcs.length > 1 && Math.random() < .35) {
+    await new Promise(r=>setTimeout(r, 1000 + Math.random()*1800));
+    const m = rnd(npcs.filter(x=>x.nick!==n.nick));
+    if (m) npcSpeak(m, `${m.nick} ngồi kế bên nghe lỏm rồi chen vô một câu, tự nhiên như ngoài đời.`);
+  }
+}
+
+// ---------- actions: little gestures people do ----------
+const ACTS = {
+  uong: {name:"Uống", dur:2200},
+  cung: {name:"Cụng ly", dur:2000, pop:"dô!"},
+  vay:  {name:"Vẫy tay", dur:2400, pop:"ê!"},
+  cuoi: {name:"Cười", dur:2400, pop:"ha ha"},
+  vuon: {name:"Vươn vai", dur:2400},
+  ngap: {name:"Ngáp", dur:2400, pop:"oáp…"},
+  nhay: {name:"Nhún nhảy", dur:4200, pop:"♪"},
+  dt:   {name:"Lướt điện thoại", dur:6000},
+  gai:  {name:"Gãi đầu", dur:2000, pop:"hơ…"},
+};
+function doAct(p, a){
+  if (!ACTS[a]) return; p.act = a; p.actAt = Date.now();
+  if (a === "cung") { clink(p.seat); cheersNeighbours(p); }
+}
+function cheersNeighbours(p){
+  if (p.seat === null || p.seat === undefined) return;
+  const s = SEATS[p.seat];
+  for (const n of npcs) { if (n === p || n.seat === null) continue; const t = SEATS[n.seat];
+    if (t.row === s.row && Math.abs(t.x - s.x) < 150 && Math.random() < .85) setTimeout(()=>{ if (n.act !== "cung" || Date.now()-n.actAt > 1500) { n.act = "cung"; n.actAt = Date.now(); } }, 250 + Math.random()*400); }
+}
+function autoActFromText(p, text){
+  const t = text.toLowerCase();
+  if (/(ha ?ha|hi ?hi|khà|hề hề|kk|=\)\)|:\)\))/.test(t)) doAct(p, "cuoi");
+  else if (/(\bdô\b|\bzô\b|\byo\b|cụng|một hai ba|1 2 3)/.test(t)) doAct(p, "cung");
+  else if (/(buồn ngủ|ngáp|mệt)/.test(t)) doAct(p, "ngap");
+  else if (/(\bê\b|chào|hello|hi\b)/.test(t)) doAct(p, "vay");
+}
+function actState(p, now){
+  let a = p.act, at = p.actAt;
+  if (!p.isYou && !p.sim) { at = actSeen.get(p.key) || 0; }
+  if (!a || !ACTS[a]) return null;
+  const age = now - at; if (age < 0 || age > ACTS[a].dur) return null;
+  return { a, age, k: age/ACTS[a].dur };
+}
+setInterval(()=>{
+  if (!simOn || document.hidden || !npcs.length || !isLeader()) return;
+  const n = rnd(npcs); if (actState(n, Date.now())) return;
+  const r = Math.random();
+  doAct(n, r < .35 ? "uong" : r < .48 ? "dt" : r < .58 ? "gai" : r < .66 ? "vuon" : r < .74 ? "ngap" : r < .82 ? "cuoi" : r < .9 ? "cung" : "nhay");
+}, 2600);
+
+queueMicrotask(()=>{ seedNpcs(); renderPeople(); });
+// ---------- shared AI guests (web version with Firebase) ----------
+// The longest-present visitor runs the AI guests and publishes them; everyone else mirrors.
+const SHARED = () => !!(window.QC_SYNC && window.QC_SYNC.npcs);
+const isLeader = () => !SHARED() || window.QC_SYNC.isLeader();
+const srvOff = () => (window.QC_TIME ? window.QC_TIME() - Date.now() : 0);
+let npcFirstSync = true, npcAdopted = false, lastNpcJson = "", npcQuietUntil = 0;
+function npcToWire(n){ const o = srvOff(), s = t => t ? Math.round(t + o) : 0;
+  return { key:n.key, nick:n.nick, g:n.g||"m", outfit:n.outfit, seat:n.seat, drink:n.drink||"", food:n.food||"", hue:n.hue, act:n.act||"", actAt:s(n.actAt), servedAt:s(n.servedAt), foodAt:s(n.foodAt) }; }
+function applyNpcList(list, silent){
+  if (!Array.isArray(list)) list = list && typeof list === "object" ? Object.values(list) : [];
+  const o = srvOff(), loc = t => t ? Number(t) - o : 0;
+  const keep = [];
+  for (const it of list) {
+    if (!it || typeof it.nick !== "string" || !PERSONAS[it.nick]) continue;
+    const seat = Number.isInteger(it.seat) && it.seat >= 0 && it.seat < SEATS.length ? it.seat : null; if (seat === null) continue;
+    let n = npcs.find(x => x.key === it.key);
+    if (!n) { n = { key:String(it.key), nick:it.nick, g: PERSONAS[it.nick].g, msg:"", msgAt:0, sim:true, act:"", actAt:0 }; if (!silent && Date.now() > npcQuietUntil) pushChat({kind:"sys", text:`${it.nick} (AI) vừa tấp vô quán.`}); }
+    n.outfit = OUTFITS[it.outfit] ? it.outfit : PERSONAS[it.nick].of; n.seat = seat; n.hue = Number(it.hue)||0;
+    n.drink = DRINKS[it.drink] ? it.drink : null; n.food = FOODS[it.food] ? it.food : null;
+    n.servedAt = loc(it.servedAt); n.foodAt = loc(it.foodAt);
+    const ia = loc(it.actAt); if (ACTS[it.act] && ia > (n.actAt||0)) { n.act = it.act; n.actAt = ia; }
+    keep.push(n);
+  }
+  if (!silent && Date.now() > npcQuietUntil) for (const n of npcs) if (!keep.includes(n)) pushChat({kind:"sys", text:`${n.nick} (AI) trả tiền rồi chạy về.`});
+  npcs = keep; renderPeople(); renderSeatSelect();
+}
+function startSharedNpcs(){
+  const S = window.QC_SYNC; npcQuietUntil = Date.now() + 5000;
+  S.onNpcs(list => {
+    // the first snapshot is adopted by everyone (keeps the café the same across leaders); afterwards only followers mirror
+    const has = list && (Array.isArray(list) ? list.length : Object.keys(list).length);
+    if (!npcAdopted) { if (has) { npcAdopted = true; applyNpcList(list, true); } npcFirstSync = false; return; }
+    if (!isLeader() && has) applyNpcList(list, false);
+  });
+  S.onSay(({ nick, text }) => {
+    const n = npcs.find(x => x.nick === nick); text = clean(text, 90); if (!text) return;
+    if (n) { n.msg = text; n.msgAt = Date.now(); }
+    remember(text); pushChat({ who:nick, text, kind:"ai", hue: n ? n.hue : 200 });
+    if (n) { autoActFromText(n, text); if (Math.random() < .25 && npcs.length > 1) { const m = rnd(npcs.filter(x=>x!==n)); if (m) setTimeout(()=>doAct(m, "cuoi"), 700); } }
+  });
+  setInterval(() => {
+    if (!isLeader() || npcFirstSync) return;
+    const j = JSON.stringify(npcs.map(npcToWire));
+    if (j !== lastNpcJson) { lastNpcJson = j; S.setNpcs(JSON.parse(j)); }
+  }, 800);
+}
+
+
+// ---------- occupancy ----------
+function meView(){ return { key:"me", g: me.g, act: me.act, actAt: me.actAt, outfit: me.outfit, nick: myName(), seat: me.seat, drink: me.drink, food: me.food, msg: me.msg, msgAt: me.msgAt, hue: me.hue, servedAt: me.servedAt, foodAt: me.foodAt, isYou:true, real:true }; }
+function occupants(){
+  const map = new Map(), standing = [];
+  const put = p => { if (p.seat === null || p.seat === undefined) { standing.push(p); return; } if (map.has(p.seat)) standing.push(p); else map.set(p.seat, p); };
+  if (me.seat !== null) put(meView());
+  for (const o of others) put(o);
+  if (simOn) for (const n of npcs) if (!map.has(n.seat)) map.set(n.seat, n);
+  return { map, standing };
+}
+function msgAge(p, now){ if (!p.msg) return Infinity; if (p.isYou || p.sim) return now - p.msgAt; return now - (msgSeen.get(p.key) || 0); }
+function servedAge(p, now){ if (p.isYou || p.sim) return p.servedAt ? now - p.servedAt : Infinity; return now - (served.get(p.key) || 0); }
+function foodAge(p, now){ if (p.isYou || p.sim) return p.foodAt ? now - p.foodAt : Infinity; return now - (foodServed.get(p.key) || 0); }
+
+// ---------- actions ----------
+const mateOf = i => i ^ 1;   // the two stools of one table are neighbours in SEATS
+function takeSeat(i){
+  if (me.seat === i) return;
+  const map = occupants().map, occ = map.get(i);
+  if (occ && !occ.isYou) { ownerSay(`Dạ ghế đó ${occ.nick} ngồi rồi, qua ghế khác nghen!`); return; }
+  me.seat = i; settleNpcs(); sendPresence(); renderAll();
+  const mate = map.get(mateOf(i));
+  if (mate && !mate.isYou) askToShare(mate);
+  else if (!me.drink && !pending.drink) ownerSay(rnd([`Dạ ${myName()} uống gì nè?`,`${myName()} ơi, uống chi nè, em làm liền!`]));
+}
+function askToShare(mate){
+  const line = rnd([`xin phép ngồi chung bàn với ${mate.nick} nha?`,`${mate.nick} ơi, cho mình ngồi chung bàn được hông?`,`hết bàn trống rồi, ngồi ké ${mate.nick} xíu nha`]);
+  me.msg = line; me.msgAt = Date.now(); sendPresence();
+  pushChat({who:myName(), text:line, kind:"me", hue:me.hue});
+  if (mate.sim) { const n = npcs.find(x => x.nick === mate.nick); if (n) npcSpeak(n, `${myName()} vừa xin phép ngồi chung bàn với ${n.nick}. ${n.nick} vui vẻ đồng ý, nói tự nhiên như ngoài đời.`, ["ngồi đi, khách sáo chi","ờ ngồi đi, có ai đâu","ngồi đi cho vui","trời ơi ngồi đi, xin phép chi"]); }
+}
+function leaveSeat(){ me.seat = null; me.drink = null; me.food = null; sendPresence(); renderAll(); ownerSay("Dạ về cẩn thận nghen, đường trơn lắm đó!"); }
+function freeSeatsForMe(){ const map = occupants().map; const free = SEATS.map((_,i)=>i).filter(i => !map.has(i) || map.get(i).isYou);
+  return free.sort((a,b) => (map.has(mateOf(a)) ? 1 : 0) - (map.has(mateOf(b)) ? 1 : 0)); }
+function order(kind, k){
+  if (me.seat === null) { const f = freeSeatsForMe(); if (!f.length) { ownerSay("Dạ hết ghế rồi, đợi em xíu nghen!"); return; } me.seat = f[0]; settleNpcs(); const mt = occupants().map.get(mateOf(f[0])); if (mt && !mt.isYou) askToShare(mt); }
+  pending[kind] = k;
+  ownerSay(kind === "drink" ? rnd([`Dạ ${DRINKS[k].name.toLowerCase()} hen, có liền!`,`${DRINKS[k].name} nghen, đợi em chút xíu!`]) : FOODS[k].wait);
+  renderAll(); sendPresence();
+  setTimeout(()=>{ if (pending[kind] !== k) return; pending[kind] = null;
+    if (kind === "drink") { me.drink = k; me.servedAt = Date.now(); } else { me.food = k; me.foodAt = Date.now(); }
+    sendPresence(); renderAll(); ting(); }, kind === "drink" ? 1600 : 2600);
+}
+
+// ---------- UI ----------
+const nickEl = $("nick"), seatSel = $("seatSel"), peopleEl = $("people");
+nickEl.value = me.nick;
+let nickT = 0;
+nickEl.addEventListener("input", () => { me.nick = clean(nickEl.value,16); store.set("qc.nick", me.nick); clearTimeout(nickT); nickT = setTimeout(()=>{ sendPresence(); renderPeople(); }, 300); });
+seatSel.addEventListener("change", () => { const v = seatSel.value; if (v === "") leaveSeat(); else takeSeat(Number(v)); });
+$("leave").addEventListener("click", leaveSeat);
+function menuButtons(el, dict, kind){
+  for (const [k,d] of Object.entries(dict)) {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "b item"; b.dataset.k = k; b.dataset.kind = kind; b.setAttribute("aria-pressed","false");
+    const n = document.createElement("span"); n.textContent = d.name;
+    const p = document.createElement("span"); p.className = "p"; p.textContent = d.price;
+    b.append(n,p); b.addEventListener("click", () => order(kind, k));
+    el.append(b);
+  }
+}
+menuButtons($("drinks"), DRINKS, "drink"); menuButtons($("foods"), FOODS, "food");
+menuButtons($("pmDrinks"), DRINKS, "drink"); menuButtons($("pmFoods"), FOODS, "food");
+const popMenu = $("popMenu");
+function openOwnerMenu(){
+  $("pmTitle").textContent = rnd([`Dạ ${myName()} dùng gì nè?`,"Dạ, uống chi nè?","Em làm liền nghen, chọn đi!"]);
+  popMenu.hidden = false;
+  const sc = view.scale, sw = stage.clientWidth, sh = stage.clientHeight, pw = popMenu.offsetWidth, ph = popMenu.offsetHeight;
+  const left = Math.max(12, Math.min(sw - pw - 12, (OWNER_X + 48 - view.off)*sc)), top = Math.max(12, Math.min(sh - ph - 12, (CART_TOP - 170 - view.offY)*sc));
+  popMenu.style.left = left + "px"; popMenu.style.top = top + "px";
+  ownerSay(rnd(["Dạ uống gì nè?","Dạ có em nè!","Kêu em hả, dạ!"]));
+  renderMenu();
+}
+function closeOwnerMenu(){ popMenu.hidden = true; }
+$("pmClose").addEventListener("click", closeOwnerMenu);
+popMenu.addEventListener("click", e => { if (e.target.closest(".item")) setTimeout(closeOwnerMenu, 150); });
+document.addEventListener("keydown", e => { if (e.key === "Escape" && !popMenu.hidden) closeOwnerMenu(); });
+for (const [k,v] of Object.entries(ACTS)) {
+  const bt = document.createElement("button"); bt.type = "button"; bt.className = "b act"; bt.textContent = v.name;
+  bt.addEventListener("click", () => {
+    if (me.seat === null) { ownerSay("Ngồi xuống đã rồi hẵng quậy nghen!"); return; }
+    doAct(me, k); sendPresence();
+    if (k === "cung" && simOn && npcs.length && Math.random() < .5) { const n = rnd(npcs); setTimeout(()=>npcSay(n, rnd(["dô dô","zô 100%","một hai ba dô","dô, uống cạn nha"])), 600); }
+  });
+  $("acts").append(bt);
+}
+const styleSel = $("styleSel");
+styleSel.value = furnStyle;
+styleSel.addEventListener("change", () => { if (!["mix","nhua","go"].includes(styleSel.value)) return; furnStyle = styleSel.value; store.set("qc.style", furnStyle); });
+const genderSel = $("genderSel");
+genderSel.value = me.g;
+genderSel.addEventListener("change", () => { me.g = genderSel.value === "f" ? "f" : "m"; store.set("qc.g", me.g); sendPresence(); });
+const outfitSel = $("outfitSel");
+for (const [k,v] of Object.entries(OUTFITS)) { const o = document.createElement("option"); o.value = k; o.textContent = v; outfitSel.append(o); }
+outfitSel.value = me.outfit;
+outfitSel.addEventListener("change", () => { if (!OUTFITS[outfitSel.value]) return; me.outfit = outfitSel.value; store.set("qc.outfit", me.outfit); sendPresence(); });
+let lastSend = 0;
+$("msgForm").addEventListener("submit", e => {
+  e.preventDefault();
+  const v = clean($("msg").value, 80); if (!v) return;
+  const now = Date.now(); if (now - lastSend < 1500) return; lastSend = now;
+  me.msg = v; me.msgAt = now; $("msg").value = ""; autoActFromText(me, v); sendPresence();
+  pushChat({who:myName(), text:v, kind:"me", hue:me.hue});
+  if (me.seat === null) ownerSay("Ngồi xuống đi rồi tám cho dui nè!");
+  aiReply(v);
+});
+$("simT").addEventListener("change", e => { simOn = e.target.checked; if (simOn && !npcs.length) seedNpcs(); renderPeople(); renderSeatSelect(); });
+
+function renderSeatSelect(){
+  const { map } = occupants();
+  seatSel.textContent = "";
+  const o0 = document.createElement("option"); o0.value = ""; o0.textContent = "Chưa ngồi (đứng ngoài hiên)"; seatSel.append(o0);
+  SEATS.forEach((s,i)=>{
+    const o = document.createElement("option"); o.value = String(i);
+    const occ = map.get(i), busy = occ && !occ.isYou;
+    o.textContent = s.label + (busy ? ` · ${occ.nick}${occ.sim ? " (AI)" : ""} đang ngồi` : "");
+    o.disabled = !!busy; seatSel.append(o);
+  });
+  seatSel.value = me.seat === null ? "" : String(me.seat);
+  $("leave").disabled = me.seat === null;
+}
+function renderMenu(){
+  for (const b of document.querySelectorAll(".item")) {
+    const kind = b.dataset.kind, cur = pending[kind] || me[kind];
+    b.setAttribute("aria-pressed", String(b.dataset.k === cur));
+  }
+}
+function orderText(p, pend){
+  const parts = [];
+  if (pend && pend.drink) parts.push("chờ nước…"); else if (p.drink) parts.push(DRINKS[p.drink].name);
+  if (pend && pend.food) parts.push("chờ đồ ăn…"); else if (p.food) parts.push(FOODS[p.food].name);
+  return parts.join(" + ") || (p.seat===null ? "đứng ngoài hiên" : "mới ngồi");
+}
+let seatSig = "";
+function renderPeople(){
+  { const sig = [...occupants().map.entries()].map(([k,v]) => k + ":" + v.nick).sort().join(","); if (sig !== seatSig) { seatSig = sig; renderSeatSelect(); } }
+  peopleEl.textContent = "";
+  const rows = [{ nick: myName() + " (bạn)", d: orderText(me, pending), cls:"me" }];
+  for (const o of others) rows.push({ nick: o.nick + (o.otherTab ? " (tab khác)" : ""), d: orderText(o), cls:"" });
+  if (simOn) for (const n of npcs) rows.push({ nick: n.nick + " · AI", d: orderText(n), cls:"sim" });
+  for (const r of rows) {
+    const li = document.createElement("li"); if (r.cls) li.className = r.cls;
+    const a = document.createElement("span"); a.className = "n"; a.textContent = r.nick;
+    const b = document.createElement("span"); b.className = "d"; b.textContent = r.d;
+    li.append(a,b); peopleEl.append(li);
+  }
+}
+function renderAll(){ renderSeatSelect(); renderMenu(); renderPeople(); }
+renderAll(); renderChat();
+
+// ---------- audio ----------
+const REAL = { ok:false };
+let rainBus = null, otherBus = null, actx = null, master = null, noiseBuf = null, brownBuf = null, layers = null, soundOn = false, viVoice = null;
+function loopNoise(){ const s = actx.createBufferSource(); s.buffer = noiseBuf; s.loop = true; s.start(0, Math.random()*3); return s; }
+function ensureAudio(){
+  if (actx) return actx;
+  const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return null;
+  actx = new AC();
+  const sr = actx.sampleRate;
+  master = actx.createGain(); master.gain.value = 0;
+  const comp = actx.createDynamicsCompressor(); comp.threshold.value = -14; comp.ratio.value = 3;
+  master.connect(comp).connect(actx.destination);
+  rainBus = actx.createGain(); rainBus.gain.value = vol.rain*vol.rain*1.2; rainBus.connect(master);
+  otherBus = actx.createGain(); otherBus.gain.value = vol.other*vol.other*1.2; otherBus.connect(master);
+  noiseBuf = actx.createBuffer(2, sr*4, sr);
+  for (let c=0;c<2;c++){ const d = noiseBuf.getChannelData(c); for (let i=0;i<d.length;i++) d[i] = Math.random()*2-1; }
+  // brown noise: warm, soft, no hiss
+  brownBuf = actx.createBuffer(2, sr*6, sr);
+  for (let c=0;c<2;c++){ const d = brownBuf.getChannelData(c); let last = 0; for (let i=0;i<d.length;i++){ last = (last + .02*(Math.random()*2-1)) / 1.02; d[i] = last*3.2; } }
+  const loopBuf = buf => { const s = actx.createBufferSource(); s.buffer = buf; s.loop = true; s.start(0, Math.random()*3); return s; };
+  const filt = (type, f, q) => { const b = actx.createBiquadFilter(); b.type = type; b.frequency.value = f; if (q) b.Q.value = q; return b; };
+  // 1. rain body: a soft wash, like a shower heard from under a roof
+  const bodyG = actx.createGain(); loopBuf(brownBuf).connect(filt("lowpass", 900)).connect(bodyG).connect(rainBus);
+  // 2. the "rào rào" of the shower, mid band only
+  const midG = actx.createGain(); loopBuf(noiseBuf).connect(filt("bandpass", 650, .45)).connect(filt("lowpass", 2200)).connect(midG).connect(rainBus);
+  // 3. a whisper of air on top, kept very low so it never stings
+  const hissG = actx.createGain(); loopBuf(noiseBuf).connect(filt("highpass", 2800)).connect(filt("lowpass", 5500)).connect(hissG).connect(rainBus);
+  // 4. drops on the roof tiles / tarp: rounded low taps
+  const pat = actx.createBuffer(2, sr*5, sr);
+  for (let c=0;c<2;c++){ const d = pat.getChannelData(c);
+    for (let k=0;k<1100;k++){ const s0 = Math.floor(Math.random()*(d.length-1200)), a = (Math.random()*.7+.15)*(Math.random()<.5?-1:1), len = 300+Math.random()*800, w = .04+Math.random()*.07;
+      for (let j=0;j<len;j++) d[s0+j] += a*Math.exp(-j/(len/4))*Math.sin(j*w); } }
+  const patS = actx.createBufferSource(); patS.buffer = pat; patS.loop = true; patS.start();
+  const patG = actx.createGain(); patS.connect(filt("lowpass", 1600)).connect(patG).connect(rainBus);
+  // 5. city bed: the low rumble of Saigon traffic a few streets away
+  const cityG = actx.createGain(); cityG.gain.value = .22;
+  loopBuf(brownBuf).connect(filt("lowpass", 220)).connect(cityG).connect(otherBus);
+  const swell = actx.createOscillator(), swellG = actx.createGain(); swell.frequency.value = .09; swellG.gain.value = .08; swell.connect(swellG).connect(cityG.gain); swell.start();
+  // 6. people talking around the café
+  const murG = actx.createGain(); murG.gain.value = .11;
+  loopBuf(noiseBuf).connect(filt("bandpass", 480, 2.4)).connect(murG).connect(otherBus);
+  const lfo = actx.createOscillator(), lfoG = actx.createGain(); lfo.frequency.value = .37; lfoG.gain.value = .05; lfo.connect(lfoG).connect(murG.gain); lfo.start();
+  const murG2 = actx.createGain(); murG2.gain.value = .045;
+  loopBuf(noiseBuf).connect(filt("bandpass", 1050, 3.2)).connect(murG2).connect(otherBus);
+  const lfo2 = actx.createOscillator(), lfoG2 = actx.createGain(); lfo2.frequency.value = .61; lfoG2.gain.value = .03; lfo2.connect(lfoG2).connect(murG2.gain); lfo2.start();
+  layers = { bodyG, midG, hissG, patG, murG, cityG, murG2 };
+  const mk = (name, bus, loop) => {
+    try {
+      const a = new Audio("audio/" + name + ".mp3"); a.loop = loop; a.preload = "auto";
+      const src = actx.createMediaElementSource(a), lp = actx.createBiquadFilter(), g = actx.createGain();
+      lp.type = "lowpass"; lp.frequency.value = 20000; g.gain.value = 0;
+      src.connect(lp).connect(g).connect(bus);
+      if (loop) a.addEventListener("playing", () => { if (REAL.ok) return; REAL.ok = true;
+        for (const k of ["bodyG","midG","hissG","patG","murG","cityG","murG2"]) { try { layers[k].disconnect(); } catch(e){} }
+        setLevelAudio(W.level, true); });
+      return { a, g, lp };
+    } catch(e) { return null; }
+  };
+  REAL.light = mk("rain-light", rainBus, true); REAL.tarp = mk("rain-tarp", rainBus, true); REAL.heavy = mk("rain-heavy", rainBus, true);
+  REAL.street = mk("street", otherBus, true); REAL.crowd = mk("crowd", otherBus, true); REAL.thunder = mk("thunder", rainBus, false);
+  setLevelAudio(W.level, true);
+  return actx;
+}
+const LOOPS = ["light","tarp","heavy","street","crowd"];
+function realPlay(on){ for (const k of LOOPS) { const r = REAL[k]; if (!r) continue; if (on) r.a.play().catch(()=>{}); else r.a.pause(); } if (!on && REAL.thunder) REAL.thunder.a.pause(); }
+const TH_ON = [0.6, 21.0, 28.9, 41.6, 55.0];
+function thunderSound(strong){
+  const r = REAL.thunder;
+  if (!REAL.ok || !r || !audioLive()) { thunder(strong ? .7 + Math.random()*.3 : .25 + Math.random()*.2); return; }
+  const t0 = actx.currentTime;
+  try { r.a.currentTime = rnd(TH_ON) + Math.random()*.3; } catch(e){}
+  r.lp.frequency.setValueAtTime(strong ? 12000 : 650, t0);
+  r.g.gain.cancelScheduledValues(t0); r.g.gain.setValueAtTime(.0001, t0);
+  r.g.gain.exponentialRampToValueAtTime(strong ? 1.15 : .5, t0 + .06); r.g.gain.setTargetAtTime(.0001, t0 + 4.5, .7);
+  r.a.play().catch(()=>{}); clearTimeout(r.stopT); r.stopT = setTimeout(()=>{ try { r.a.pause(); } catch(e){} }, 8500);
+}
+function setLevelAudio(level, now){
+  if (!layers) return; const t = actx.currentTime, k = now ? .01 : .8;
+  if (REAL.ok) { const set = (r,v) => { if (r) r.g.gain.setTargetAtTime(v, t, k); };
+    set(REAL.light, .9 - .35*level); set(REAL.tarp, .22 + .6*level);
+    set(REAL.heavy, level < .4 ? 0 : Math.pow((level-.4)/.6, 1.2)*1.05);
+    set(REAL.street, .6*(1 - .35*level)); set(REAL.crowd, .38*(1 - .45*level)); }
+  layers.bodyG.gain.setTargetAtTime(.55 + .75*level, t, k);
+  layers.midG.gain.setTargetAtTime(.10 + .38*level*level, t, k);
+  layers.hissG.gain.setTargetAtTime(.006 + .035*level, t, k);
+  layers.patG.gain.setTargetAtTime(.30 + .30*level, t, k);
+  layers.murG.gain.setTargetAtTime(.11*(1-.35*level), t, k);
+}
+// water dripping off the gutter into a puddle (tọt… tọt…)
+function drip(){
+  if (!audioLive()) return;
+  const t0 = actx.currentTime, o = actx.createOscillator(), g = actx.createGain(), f = 700 + Math.random()*500;
+  o.type = "sine"; o.frequency.setValueAtTime(f, t0); o.frequency.exponentialRampToValueAtTime(f*.45, t0+.07);
+  g.gain.setValueAtTime(.0001,t0); g.gain.exponentialRampToValueAtTime(.06,t0+.004); g.gain.exponentialRampToValueAtTime(.0001,t0+.12);
+  o.connect(g); pan(g, rnd([110, 850, 300, 700])).connect(rainBus); o.start(t0); o.stop(t0+.15);
+}
+let dripT = 0;
+function scheduleDrips(){ clearTimeout(dripT); if (!soundOn) return; dripT = setTimeout(()=>{ drip(); scheduleDrips(); }, 350 + Math.random()*1400); }
+const vol = { rain: .8, other: .55 };
+{ const r = Number(store.get("qc.vr")), o = Number(store.get("qc.vo"));
+  if (store.get("qc.vr") !== null && Number.isFinite(r)) vol.rain = Math.max(0,Math.min(1,r/100));
+  if (store.get("qc.vo") !== null && Number.isFinite(o)) vol.other = Math.max(0,Math.min(1,o/100));
+  $("volRain").value = String(Math.round(vol.rain*100)); $("volOther").value = String(Math.round(vol.other*100)); }
+function bindVol(id, key, sk){
+  $(id).addEventListener("input", e => { vol[key] = Number(e.target.value)/100; store.set(sk, e.target.value);
+    const bus = key === "rain" ? rainBus : otherBus; if (bus) bus.gain.setTargetAtTime(vol[key]*vol[key]*1.2, actx.currentTime, .05); });
+}
+bindVol("volRain","rain","qc.vr"); bindVol("volOther","other","qc.vo");
+function clink(seat){
+  if (!audioLive()) return;
+  const x = seat !== null && seat !== undefined && SEATS[seat] ? SEATS[seat].x : 480, t0 = actx.currentTime + .05;
+  for (const f of [3150, 4120, 5230]) { const o = actx.createOscillator(), g = actx.createGain(); o.type = "sine"; o.frequency.value = f*(.97+Math.random()*.06);
+    g.gain.setValueAtTime(.0001,t0); g.gain.exponentialRampToValueAtTime(.05,t0+.003); g.gain.exponentialRampToValueAtTime(.0001,t0+.5);
+    o.connect(g); pan(g, x).connect(otherBus); o.start(t0); o.stop(t0+.55); }
+}
+function audioLive(){ return soundOn && actx && actx.state === "running"; }
+function pan(node, x){ if (!actx.createStereoPanner) return node; const p = actx.createStereoPanner(); p.pan.value = Math.max(-1, Math.min(1, (x-480)/520)); node.connect(p); return p; }
+$("soundQuick").addEventListener("click", () => $("soundBtn").click());
+$("soundBtn").addEventListener("click", e => {
+  const a = ensureAudio(); if (!a) return;
+  a.resume();
+  const on = e.currentTarget.getAttribute("aria-pressed") !== "true";
+  e.currentTarget.setAttribute("aria-pressed", String(on));
+  e.currentTarget.textContent = on ? "Tắt âm thanh" : "Bật âm thanh";
+  $("soundQuick").setAttribute("aria-pressed", String(on)); $("soundQuick").textContent = on ? "Tắt âm thanh" : "Bật âm thanh";
+  soundOn = on;
+  master.gain.setTargetAtTime(on ? .9 : 0, a.currentTime, .3);
+  if (!on && window.speechSynthesis) speechSynthesis.cancel();
+  realPlay(on);
+  if (on && ytPlayer && ytReady) { try { ytPlayer.unMute(); } catch(e){} }
+  if (on) { schedulePings(); scheduleDrips(); }
+});
+function ting(){
+  if (!audioLive()) return;
+  const o = actx.createOscillator(), g = actx.createGain(); o.type = "sine"; o.frequency.value = 1760;
+  g.gain.setValueAtTime(.0001, actx.currentTime); g.gain.exponentialRampToValueAtTime(.12, actx.currentTime+.01); g.gain.exponentialRampToValueAtTime(.0001, actx.currentTime+.9);
+  o.connect(g).connect(otherBus); o.start(); o.stop(actx.currentTime+1);
+}
+// spoon stirring a glass somewhere in the café (leng keng)
+function ping(){
+  if (!audioLive()) return;
+  const t0 = actx.currentTime, n = 2 + Math.floor(Math.random()*4), x = 280 + Math.random()*520;
+  for (let i=0;i<n;i++){ const o = actx.createOscillator(), g = actx.createGain(); o.type = "sine"; o.frequency.value = 2600 + Math.random()*900;
+    const s = t0 + i*(.09+Math.random()*.05); g.gain.setValueAtTime(.0001,s); g.gain.exponentialRampToValueAtTime(.05,s+.004); g.gain.exponentialRampToValueAtTime(.0001,s+.25);
+    o.connect(g); pan(g, x).connect(otherBus); o.start(s); o.stop(s+.3); }
+}
+let pingT = 0;
+function schedulePings(){ clearTimeout(pingT); if (!soundOn) return; pingT = setTimeout(()=>{ ping(); schedulePings(); }, 2500 + Math.random()*6000); }
+function horn(x, kind){
+  if (!audioLive()) return;
+  const f = kind === "taxi" ? 440 : kind === "bus" ? 300 : 640, beeps = kind === "bus" ? 1 : 2, len = kind === "bus" ? .45 : .12;
+  for (let i=0;i<beeps;i++){ const o = actx.createOscillator(), o2 = actx.createOscillator(), g = actx.createGain();
+    o.type = "square"; o.frequency.value = f; o2.type = "square"; o2.frequency.value = f*1.26;
+    const t0 = actx.currentTime + i*.18; g.gain.setValueAtTime(.0001,t0); g.gain.exponentialRampToValueAtTime(.05,t0+.01); g.gain.setValueAtTime(.05,t0+len-.03); g.gain.exponentialRampToValueAtTime(.0001,t0+len);
+    o.connect(g); o2.connect(g); pan(g, x).connect(otherBus); o.start(t0); o2.start(t0); o.stop(t0+len+.02); o2.stop(t0+len+.02); }
+}
+function thunder(strength){
+  if (!audioLive()) return;
+  const t0 = actx.currentTime + .15 + (1-strength)*1.4;
+  const s = actx.createBufferSource(); s.buffer = noiseBuf;
+  const lp = actx.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.setValueAtTime(700*strength+150, t0); lp.frequency.exponentialRampToValueAtTime(90, t0+2.5);
+  const g = actx.createGain(); g.gain.setValueAtTime(.0001,t0); g.gain.exponentialRampToValueAtTime(1.6*strength, t0+.08);
+  g.gain.setTargetAtTime(.6*strength, t0+.3, .25); g.gain.exponentialRampToValueAtTime(.0001, t0+3.6);
+  s.connect(lp).connect(g).connect(rainBus); s.start(t0, Math.random()*.4); s.stop(t0+3.8);
+}
+// engine hum + wet-tyre hiss for each passing vehicle
+const ENGINE = { xeso:[62,.17,.26], taxi:[44,.12,.40], bus:[33,.24,.50], bagac:[54,.19,.30], xichlo:[0,0,.16], cavien:[0,0,.10], banhmi:[0,0,.10] };
+function vehicleSound(b){
+  if (!audioLive() || b.snd) return;
+  const [f, eg, tg] = ENGINE[b.type];
+  const out = actx.createGain(); out.gain.value = 0;
+  const sp = actx.createStereoPanner ? actx.createStereoPanner() : null;
+  if (sp) { out.connect(sp).connect(otherBus); } else out.connect(otherBus);
+  const nodes = [];
+  if (f) { const o = actx.createOscillator(); o.type = "sawtooth"; o.frequency.value = f*(.9+Math.random()*.25);
+    const vib = actx.createOscillator(), vg = actx.createGain(); vib.frequency.value = 7+Math.random()*5; vg.gain.value = f*.06; vib.connect(vg).connect(o.frequency);
+    const lp = actx.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 320; const g = actx.createGain(); g.gain.value = eg;
+    o.connect(lp).connect(g).connect(out); o.start(); vib.start(); nodes.push(o, vib); }
+  const n = loopNoise(), bp = actx.createBiquadFilter(); bp.type = "bandpass"; bp.frequency.value = 700; bp.Q.value = .7;
+  const ng = actx.createGain(); ng.gain.value = tg; n.connect(bp).connect(ng).connect(out); nodes.push(n);
+  b.snd = { out, sp, nodes };
+}
+function updateVehicleSound(b){
+  if (!b.snd) return;
+  const d = Math.abs(b.x-480), prox = Math.max(0, 1 - d/620) * (1 + W.flood*.7);
+  b.snd.out.gain.setTargetAtTime(soundOn ? prox*prox*(b.y > 560 ? 1 : .75) : 0, actx.currentTime, .08);
+  if (b.snd.sp) b.snd.sp.pan.setTargetAtTime(Math.max(-1,Math.min(1,(b.x-480)/520)), actx.currentTime, .08);
+}
+function stopVehicleSound(b){ if (!b.snd) return; for (const n of b.snd.nodes) { try { n.stop(); } catch(e){} } try { b.snd.out.disconnect(); } catch(e){} b.snd = null; }
+// Vietnamese voice for street vendors and cô Ba, when the device has one
+function pickVoice(){ try { const vs = window.speechSynthesis ? speechSynthesis.getVoices() : []; viVoice = vs.find(v => /^vi/i.test(v.lang)) || null; } catch(e){ viVoice = null; } }
+if (window.speechSynthesis) { pickVoice(); try { speechSynthesis.addEventListener("voiceschanged", pickVoice); } catch(e){} }
+function speak(text, pitch){
+  if (!soundOn || !viVoice || !window.speechSynthesis) return;
+  try { if (speechSynthesis.speaking) return; const u = new SpeechSynthesisUtterance(text); u.voice = viVoice; u.lang = viVoice.lang; u.rate = 1.05; u.pitch = pitch || 1; u.volume = Math.min(1, vol.other*1.3); speechSynthesis.speak(u); } catch(e){}
+}
+
+// ---------- canvas sizing ----------
+let view = { w:960, h:600, off:0, offY:0, scale:1, dpr:1 };
+function inFs(){ return document.fullscreenElement === stage || stage.classList.contains("pseudo-fs"); }
+function resize(){
+  stage.classList.toggle("narrow", !inFs() && stage.clientWidth > 0 && stage.clientWidth < 600);
+  const cssW = canvas.clientWidth || 960, cssH = canvas.clientHeight || cssW*LH/LW;
+  let sc = Math.max(cssW/LW, cssH/LH);
+  if (cssW/sc < 600) sc = cssW/600;
+  const visW = cssW/sc, visH = cssH/sc;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2, Math.sqrt(4.2e6/(cssW*cssH)));
+  canvas.width = Math.round(cssW*dpr); canvas.height = Math.round(cssH*dpr);
+  view = { w:visW, h:visH, off:(LW-visW)/2, offY: visH < LH ? (LH-visH)*.55 : Math.max(LH+20-visH, -330), scale:sc, dpr };
+}
+new ResizeObserver(resize).observe(stage); resize();
+const fsBtn = $("fsBtn");
+function updFs(){ const on = inFs(); fsBtn.textContent = on ? "Thoát toàn màn hình" : "Toàn màn hình"; fsBtn.setAttribute("aria-pressed", String(on)); requestAnimationFrame(resize); }
+function exitPseudo(){ stage.classList.remove("pseudo-fs"); document.documentElement.classList.remove("noscroll"); }
+fsBtn.addEventListener("click", async () => {
+  if (inFs()) { if (document.fullscreenElement) { try { await document.exitFullscreen(); } catch(e){} } exitPseudo(); updFs(); return; }
+  try { if (!stage.requestFullscreen) throw new Error("no api"); await stage.requestFullscreen(); }
+  catch(e) { stage.classList.add("pseudo-fs"); document.documentElement.classList.add("noscroll"); }
+  updFs();
+});
+document.addEventListener("fullscreenchange", updFs);
+document.addEventListener("keydown", e => { if (e.key === "Escape" && stage.classList.contains("pseudo-fs")) { exitPseudo(); updFs(); } });
+function toLogical(e){ const r = canvas.getBoundingClientRect(); return { x:(e.clientX-r.left)/view.scale + view.off, y:(e.clientY-r.top)/view.scale + view.offY }; }
+let hover = -1;
+function seatAt(pt){ let best=-1, bd=30; SEATS.forEach((s,i)=>{ const d = Math.hypot(pt.x-s.x, (pt.y-(s.y-18))*0.7); if (d<bd){bd=d;best=i;} }); return best; }
+canvas.addEventListener("pointermove", e => { const pt = toLogical(e); hover = seatAt(pt); const occ = hover>=0 ? occupants().map.get(hover) : null; canvas.style.cursor = onOwner(pt) || (hover>=0 && (!(occ && !occ.isYou) || occ.sim)) ? "pointer" : "default"; });
+canvas.addEventListener("pointerleave", () => { hover = -1; });
+const onOwner = pt => Math.abs(pt.x - OWNER_X) < 28 && pt.y > CART_TOP - 104 && pt.y < CART_TOP + 4;
+canvas.addEventListener("click", e => { const pt = toLogical(e); if (onOwner(pt)) { closeDm(); openOwnerMenu(); return; } closeOwnerMenu(); const i = seatAt(pt);
+  if (i>=0) { const occ = occupants().map.get(i); if (occ && occ.sim) { if (me.seat === null) { ownerSay("Kiếm ghế ngồi xuống uống ly nước rồi hẵng tám nghen!"); return; } const n = npcs.find(x=>x.nick===occ.nick); if (n) { dmNick === n.nick ? closeDm() : openDm(n); } return; } closeDm(); takeSeat(i); } else closeDm(); });
+$("dmClose").addEventListener("click", closeDm);
+document.addEventListener("keydown", e => { if (e.key === "Escape" && dmNick) closeDm(); });
+let lastDm = 0;
+$("dmForm").addEventListener("submit", e => {
+  e.preventDefault(); if (!dmNick) return;
+  const v = clean($("dmMsg").value, 80); if (!v) return;
+  const now = Date.now(); if (now - lastDm < 1500) return; lastDm = now;
+  const n = npcs.find(x=>x.nick===dmNick); if (!n) return;
+  $("dmMsg").value = ""; me.msg = v; me.msgAt = now; autoActFromText(me, v); sendPresence();
+  pushChat({who:myName(), text:v, kind:"me", hue:me.hue, to:n.nick});
+  aiReply(v, n);
+});
+
+// ---------- scene helpers ----------
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+function shutters(x,y,w,h,col){
+  ctx.fillStyle = col; ctx.fillRect(x,y,w,h);
+  ctx.strokeStyle = "rgba(0,0,0,.35)"; ctx.lineWidth = 1;
+  for (let yy=y+4; yy<y+h; yy+=5){ ctx.beginPath(); ctx.moveTo(x+2,yy); ctx.lineTo(x+w-2,yy); ctx.stroke(); }
+  ctx.beginPath(); ctx.moveTo(x+w/2,y); ctx.lineTo(x+w/2,y+h); ctx.stroke();
+  ctx.strokeStyle = "rgba(255,255,255,.12)"; ctx.strokeRect(x+.5,y+.5,w-1,h-1);
+}
+function signText(txt,x,y,font,fill){ ctx.font = font; ctx.fillStyle = fill; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText(txt,x,y); }
+
+const drops = [], splashes = [], bikes = [];
+const DROP_N = reduce ? 160 : 560;
+function newDrop(top){ return { x: Math.random()*(LW+320)-280, y: top ? Math.random()*-LH : Math.random()*LH, len: 10+Math.random()*14, v: 9+Math.random()*7, ground: 496+Math.random()*100 }; }
+for (let i=0;i<DROP_N;i++) drops.push(newDrop(false));
+function sheltered(x,y){ return x>92 && x<868 && y>160 && y<492; }
+// ---------- street of nhà ống: pre-rendered once, then lit live ----------
+const FAC_TOP = -280, FAC_BOT = 332, FAC_S = 2;
+const HOUSES = [
+  {x:-10, w:140, top:-120, c:[86,138,124], roof:"ton"},
+  {x:130, w:150, top:-34,  c:[196,150,70], roof:"flat", sign:"MAY ĐO · SỬA ĐỒ", signFloor:2},
+  {x:280, w:190, top:-214, c:[214,200,160], roof:"flat", flag:true},
+  {x:470, w:160, top:-96,  c:[128,164,186], roof:"ton"},
+  {x:630, w:120, top:-14,  c:[176,98,84], roof:"flat"},
+  {x:750, w:220, top:-166, c:[170,118,138], roof:"ton", flowers:2, paper:3},
+];
+const WINDOWS = [], FLOWERS = [], LAUNDRY = [["#d9534f",0],["#f0e6d2",1],["#4a7fc1",2],["#e8b84a",3],["#7bb36a",4]];
+const SNACKS = []; for (let i=0;i<14;i++) SNACKS.push({x:872+(i%7)*12, y:212+Math.floor(i/7)*20, c:rnd(["#e94b3c","#f4c430","#3b8ed6","#58b368","#f08a24"])});
+function mulberry(a){ return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+let facCanvas = null;
+function buildFacade(){
+  const cv = document.createElement("canvas");
+  cv.width = LW*FAC_S; cv.height = (FAC_BOT-FAC_TOP)*FAC_S;
+  const c = cv.getContext("2d"); if (!c) return;
+  c.setTransform(FAC_S,0,0,FAC_S,0,-FAC_TOP*FAC_S);
+  WINDOWS.length = 0; FLOWERS.length = 0;
+  const R = mulberry(20261103);
+  const rgb = (h,k,a) => `rgba(${h.c.map(v=>Math.round(Math.min(255,v*.58*k))).join(",")},${a===undefined?1:a})`;
+  const box = (x,y,w,h,f) => { c.fillStyle = f; c.fillRect(x,y,w,h); };
+  const rrc = (x,y,w,h,r) => { c.beginPath(); c.moveTo(x+r,y); c.arcTo(x+w,y,x+w,y+h,r); c.arcTo(x+w,y+h,x,y+h,r); c.arcTo(x,y+h,x,y,r); c.arcTo(x,y,x+w,y,r); c.closePath(); };
+  const text = (t,x,y,font,fill,align) => { c.font = font; c.fillStyle = fill; c.textAlign = align||"center"; c.textBaseline = "middle"; c.fillText(t,x,y); };
+  const grill = (x,y,w,h,step,col) => { c.strokeStyle = col||"#1d1d22"; c.lineWidth = 1.2; c.beginPath(); for (let xx=x+step/2; xx<x+w; xx+=step){ c.moveTo(xx,y); c.lineTo(xx,y+h); } c.moveTo(x,y+h*.33); c.lineTo(x+w,y+h*.33); c.moveTo(x,y+h*.66); c.lineTo(x+w,y+h*.66); c.stroke(); c.lineWidth = 2; c.strokeRect(x,y,w,h); };
+  const aircon = (x,y) => { box(x,y,24,16,"#c4c8cc"); box(x,y+14,24,2,"#8f959b"); c.strokeStyle = "#8f959b"; c.lineWidth = 1; c.beginPath(); c.arc(x+16,y+8,5,0,7); c.stroke(); for (let i=0;i<3;i++){ c.beginPath(); c.moveTo(x+3,y+4+i*3); c.lineTo(x+9,y+4+i*3); c.stroke(); }
+    c.strokeStyle = "rgba(0,0,0,.35)"; c.beginPath(); c.moveTo(x+4,y+16); c.lineTo(x+4,y+40); c.stroke(); };
+  const pot = (x,y,big,pink) => { box(x-4,y-6,8,6,"#9a4e2e"); c.fillStyle = "#2f5d34"; c.beginPath(); c.arc(x,y-9,big?7:5,0,7); c.arc(x-4,y-7,big?5:4,0,7); c.arc(x+4,y-8,big?5:3.5,0,7); c.fill();
+    if (pink) { c.fillStyle = "#c2307a"; for (let i=0;i<6;i++){ c.beginPath(); c.arc(x-5+R()*10,y-14+R()*8,1.8,0,7); c.fill(); } } };
+  const lightWin = (x,y,w,h) => WINDOWS.push({x,y,w,h, on:R()<.55, tv:R()<.15, ph:R()*9, curtain: R()<.5 ? `hsl(${Math.floor(R()*360)} 40% 40%)` : ""});
+  // sky
+  const sky = c.createLinearGradient(0,FAC_TOP,0,170); sky.addColorStop(0,"#05070f"); sky.addColorStop(.7,"#141428"); sky.addColorStop(1,"#2a2236");
+  c.fillStyle = sky; c.fillRect(0,FAC_TOP,LW,FAC_BOT-FAC_TOP);
+  for (const h of HOUSES) {
+    const x0 = h.x, x1 = h.x+h.w;
+    // wall with grime towards the bottom
+    box(x0,h.top,h.w,FAC_BOT-h.top,rgb(h,1));
+    let g = c.createLinearGradient(0,h.top,0,FAC_BOT); g.addColorStop(0,"rgba(0,0,0,0)"); g.addColorStop(1,"rgba(10,8,4,.32)");
+    box(x0,h.top,h.w,FAC_BOT-h.top,g);
+    // roof
+    if (h.roof === "ton") {
+      c.fillStyle = "#3d4855"; c.beginPath(); c.moveTo(x0-4,h.top+2); c.lineTo(x0+10,h.top-18); c.lineTo(x1-10,h.top-18); c.lineTo(x1+4,h.top+2); c.closePath(); c.fill();
+      c.strokeStyle = "rgba(255,255,255,.08)"; c.lineWidth = 1; for (let xx=x0+2; xx<x1; xx+=4){ c.beginPath(); c.moveTo(xx,h.top+1); c.lineTo(xx+(xx-(x0+x1)/2)*-.08,h.top-17); c.stroke(); }
+      c.fillStyle = "rgba(120,60,30,.35)"; c.fillRect(x0+10+R()*(h.w-40),h.top-14,18,10);
+    } else {
+      box(x0-2,h.top-9,h.w+4,9,rgb(h,.8));
+      const tx = x0 + h.w*(.5+R()*.2);
+      const tg = c.createLinearGradient(0,h.top-34,0,h.top-14); tg.addColorStop(0,"#dfe3e6"); tg.addColorStop(.5,"#9aa3aa"); tg.addColorStop(1,"#6a737a");
+      c.fillStyle = tg; rrc(tx,h.top-34,38,20,10); c.fill();
+      c.strokeStyle = "#555b62"; c.lineWidth = 2; c.beginPath(); c.moveTo(tx+8,h.top-14); c.lineTo(tx+6,h.top-9); c.moveTo(tx+30,h.top-14); c.lineTo(tx+32,h.top-9); c.stroke();
+      c.strokeStyle = "#2a2a30"; c.lineWidth = 1.2; c.beginPath(); c.moveTo(x0+18,h.top-9); c.lineTo(x0+18,h.top-46); c.moveTo(x0+8,h.top-40); c.lineTo(x0+30,h.top-40); c.moveTo(x0+10,h.top-34); c.lineTo(x0+26,h.top-34); c.stroke();
+      pot(x0+h.w*.25,h.top-9,true);
+    }
+    // upper floors
+    for (let k=1;;k++){
+      const bot = 150 - 66*(k-1), top = bot - 66;
+      if (top < h.top - 4) break;
+      box(x0,bot-6,h.w,6,rgb(h,1.3)); box(x0,bot,h.w,3,"rgba(0,0,0,.3)");
+      const force = h.flowers === k ? "balcony" : null;
+      const r = R(), kind = force || (r < .42 ? "balcony" : r < .78 ? "window" : "cage");
+      if (kind === "balcony") {
+        const dx = x0+h.w*.16, dw = h.w*.68, dy = top+10, dh = bot-dy-6;
+        box(dx-3,dy-3,dw+6,dh+3,rgb(h,.65));
+        const wood = R() < .5;
+        box(dx,dy,dw,dh, wood ? "#4a2f1d" : "#28323d");
+        lightWin(dx+3,dy+3,dw/2-5,dh-26); lightWin(dx+dw/2+2,dy+3,dw/2-5,dh-26);
+        c.strokeStyle = wood ? "#2a1a10" : "#55606b"; c.lineWidth = 1.5; c.beginPath(); c.moveTo(dx+dw/2,dy); c.lineTo(dx+dw/2,dy+dh); c.stroke();
+        if (!wood) { c.strokeStyle = "rgba(255,255,255,.12)"; c.beginPath(); for (let i=1;i<4;i++){ c.moveTo(dx,dy+i*dh/4); c.lineTo(dx+dw,dy+i*dh/4); } c.stroke(); }
+        // railing with curls
+        const ry = bot-28;
+        box(x0+3,bot-8,h.w-6,3,"#1c1c20"); box(x0+3,ry,h.w-6,3,"#1c1c20");
+        c.strokeStyle = "#1c1c20"; c.lineWidth = 1.3; c.beginPath();
+        for (let xx=x0+8; xx<x1-6; xx+=7){ c.moveTo(xx,ry+3); c.lineTo(xx,bot-8); }
+        c.stroke();
+        c.beginPath(); for (let xx=x0+11; xx<x1-10; xx+=14){ c.moveTo(xx+3,ry+10); c.arc(xx,ry+10,3,0,Math.PI*1.6); } c.stroke();
+        const np = 1 + Math.floor(R()*3);
+        for (let i=0;i<np;i++) pot(x0+12+R()*(h.w-24), ry, R()<.5, h.flowers === k);
+        if (h.flowers === k) for (let i=0;i<90;i++) FLOWERS.push({x:x0+6+R()*(h.w-12), y:ry-14+R()*16 + (R()<.45 ? R()*30 : 0), r:1.8+R()*2.6, c:["#e0368a","#c22a74","#f25ca6","#9b1f5c"][Math.floor(R()*4)]});
+      } else if (kind === "window") {
+        const n = h.w > 170 ? 2 : 1, ww = Math.min(52, h.w*.38), gap = (h.w - n*ww)/(n+1);
+        for (let i=0;i<n;i++){
+          const wx = x0 + gap + i*(ww+gap), wy = top+14, wh = 38;
+          box(wx-4,wy-6,ww+8,4,rgb(h,1.35)); box(wx-3,wy-3,ww+6,wh+6,rgb(h,.7));
+          box(wx,wy,ww,wh,"#1d2530"); lightWin(wx,wy,ww,wh);
+          grill(wx,wy,ww,wh,5);
+          if (R()<.55) aircon(wx+ww+6 > x1-26 ? wx-30 : wx+ww+6, wy+18);
+        }
+      } else {
+        const cx = x0+8, cw = h.w-16, cy = top+8, ch = bot-cy-6;
+        box(cx+6,cy+6,cw-12,ch-10,"#1d2530"); lightWin(cx+8,cy+8,cw-16,ch-30);
+        for (let i=0;i<4;i++){ box(cx+10+i*(cw-30)/4, cy+14, 8, 16, ["#d9534f","#f0e6d2","#4a7fc1","#e8b84a"][Math.floor(R()*4)]); }
+        c.strokeStyle = "#202027"; c.lineWidth = 1.2; c.beginPath();
+        for (let xx=cx; xx<=cx+cw; xx+=6){ c.moveTo(xx,cy); c.lineTo(xx,cy+ch); }
+        for (let yy=cy; yy<=cy+ch; yy+=8){ c.moveTo(cx,yy); c.lineTo(cx+cw,yy); }
+        c.stroke(); c.lineWidth = 2.4; c.strokeRect(cx,cy,cw,ch);
+      }
+      // rust streaks under the slab
+      for (let i=0;i<3;i++){ const sx = x0+6+R()*(h.w-12), sl = 10+R()*34; const sg = c.createLinearGradient(0,bot+2,0,bot+2+sl); sg.addColorStop(0,"rgba(40,25,10,.35)"); sg.addColorStop(1,"rgba(40,25,10,0)"); c.fillStyle = sg; c.fillRect(sx,bot+2,1.5+R()*2.5,sl); }
+    }
+    // damp blotches and peeling paint
+    for (let i=0;i<16;i++){ const bx = x0+R()*h.w, by = h.top+R()*(FAC_BOT-h.top), br = 8+R()*34;
+      const bg = c.createRadialGradient(bx,by,0,bx,by,br); const dark = R()<.75;
+      bg.addColorStop(0, dark ? "rgba(25,30,15,.22)" : "rgba(255,250,230,.08)"); bg.addColorStop(1,"rgba(0,0,0,0)");
+      c.fillStyle = bg; c.fillRect(bx-br,by-br,br*2,br*2); }
+    box(x1-2,h.top-10,3,FAC_BOT-h.top+10,"rgba(0,0,0,.4)");
+    // blue house-number plate
+    const pn = ["218A","45/3","12B","7","96/14","33"][HOUSES.indexOf(h)];
+    box(x0+6,140,26,9,"#2c4f9e"); c.strokeStyle = "#e9e9e9"; c.lineWidth = .8; c.strokeRect(x0+7,141,24,7); text(pn,x0+19,144.8,"600 6px 'Be Vietnam Pro', sans-serif","#fff");
+    if (h.sign) { const sy = 150-66*(h.signFloor-1)-62;
+      for (const w of WINDOWS) if (w.x < x1 && w.x+w.w > x0 && w.y < sy+24 && w.y+w.h > sy-6) w.on = false; box(x0+8,sy,h.w-16,18,"#f3efe4"); c.strokeStyle = "#b8231f"; c.lineWidth = 1.5; c.strokeRect(x0+9,sy+1,h.w-18,16); text(h.sign,x0+h.w/2,sy+9.5,"700 10px 'Be Vietnam Pro', sans-serif","#b8231f"); }
+    if (h.paper) { const py = 150-66*(h.paper-1)-58;
+      for (const w of WINDOWS) if (w.x < x1 && w.x+w.w > x1-74 && w.y < py+26 && w.y+w.h > py-4) w.on = false; box(x0+h.w-70,py,60,22,"#f4f1e8"); text("CHO THUÊ PHÒNG",x0+h.w-40,py+8,"700 6.5px 'Be Vietnam Pro', sans-serif","#c0262d"); text("có gác · giờ tự do",x0+h.w-40,py+16,"500 5.5px 'Be Vietnam Pro', sans-serif","#333"); }
+  }
+  // ---- ground floors that peek out beside the tarp ----
+  // sửa xe (left)
+  box(4,214,100,118,"#33251c"); box(4,210,100,8,"#5a5664");
+  c.fillStyle = "#2456a6"; rrc(6,164,92,40,3); c.fill();
+  text("SỬA XE",52,178,"600 17px Oswald, sans-serif","#ffffff"); text("vá vỏ · thay nhớt",52,195,"500 9px 'Be Vietnam Pro', sans-serif","#ffe27a");
+  for (let i=0;i<4;i++){ c.strokeStyle = "#0e0e12"; c.lineWidth = 8; c.beginPath(); c.ellipse(40,318-i*13,20,7,0,0,7); c.stroke(); }
+  box(70,288,22,30,"#c33"); box(74,282,14,7,"#eee");
+  // closed rolling shutter with a spray-painted ad
+  box(134,166,98,166,"#6d6f78");
+  c.strokeStyle = "rgba(0,0,0,.35)"; c.lineWidth = 1; for (let yy=170; yy<332; yy+=5){ c.beginPath(); c.moveTo(134,yy); c.lineTo(232,yy); c.stroke(); }
+  c.save(); c.translate(183,252); c.rotate(-.05);
+  text("KHOAN CẮT",0,-10,"700 13px 'Arial Narrow', sans-serif","rgba(25,25,30,.85)"); text("BÊ TÔNG",0,6,"700 13px 'Arial Narrow', sans-serif","rgba(25,25,30,.85)");
+  c.strokeStyle = "rgba(25,25,30,.8)"; c.lineWidth = 2; c.beginPath(); c.moveTo(-34,20); for (let i=0;i<14;i++) c.lineTo(-34+i*5, 20 + (i%2 ? -4 : 3)); c.stroke();
+  c.restore();
+  c.fillStyle = "rgba(180,40,40,.6)"; c.font = "700 9px sans-serif"; c.textAlign = "left"; c.fillText("rút hầm cầu", 140, 300);
+  // blue iron gate + bare wall (like a real alley)
+  box(732,196,68,136,"#24477a");
+  c.strokeStyle = "#16305a"; c.lineWidth = 2; for (let xx=736; xx<800; xx+=6){ c.beginPath(); c.moveTo(xx,200); c.lineTo(xx,330); c.stroke(); }
+  c.lineWidth = 3; c.strokeRect(733,197,66,134); c.beginPath(); c.moveTo(766,197); c.lineTo(766,331); c.stroke();
+  box(800,196,68,136,rgb(HOUSES[5],1.15));
+  for (let i=0;i<6;i++){ const bx = 800+R()*68, by = 210+R()*110, br = 10+R()*22; const bg = c.createRadialGradient(bx,by,0,bx,by,br); bg.addColorStop(0,"rgba(30,30,10,.3)"); bg.addColorStop(1,"rgba(0,0,0,0)"); c.fillStyle = bg; c.fillRect(bx-br,by-br,br*2,br*2); }
+  box(814,236,40,22,"#e8d27a"); c.strokeStyle = "#7a5a1a"; c.lineWidth = 1; c.strokeRect(815,237,38,20);
+  text("CẤM ĐỔ RÁC",834,243,"700 5.5px 'Be Vietnam Pro', sans-serif","#5a2a10"); text("phạt 500.000đ",834,251,"500 5px 'Be Vietnam Pro', sans-serif","#5a2a10");
+  c.fillStyle = "#c62828"; c.beginPath(); c.moveTo(836,316); c.lineTo(856,316); c.lineTo(853,332); c.lineTo(839,332); c.closePath(); c.fill();
+  c.strokeStyle = "rgba(0,0,0,.3)"; for (let xx=840; xx<854; xx+=3){ c.beginPath(); c.moveTo(xx,318); c.lineTo(xx,331); c.stroke(); }
+  // tạp hóa (right)
+  box(868,206,92,126,"#3b2d22"); box(866,166,94,36,"#b3261e");
+  text("TẠP HÓA",913,180,"600 17px Oswald, sans-serif","#ffd84a"); text("bia · nước ngọt · sim",913,195,"500 8.5px 'Be Vietnam Pro', sans-serif","#fff");
+  facCanvas = cv;
+}
+buildFacade();
+if (document.fonts && document.fonts.ready) document.fonts.ready.then(buildFacade).catch(()=>{});
+
+function drawBackdrop(t){
+  // sky beyond the pre-render (tall phone screens)
+  ctx.fillStyle = "#05070f"; ctx.fillRect(0,-2000,LW,2000+FAC_TOP+2);
+  if (facCanvas) ctx.drawImage(facCanvas, 0, FAC_TOP, LW, FAC_BOT-FAC_TOP);
+  const f = .5+.5*Math.sin(t/180)*Math.sin(t/470);
+  // lit windows: warm lamps, a few blue TV flickers, some curtains
+  for (const w of WINDOWS) {
+    if (!w.on) continue;
+    if (w.tv) ctx.fillStyle = `rgba(110,160,255,${.3+.04*Math.sin(t/1800+w.ph)})`;
+    else ctx.fillStyle = `rgba(255,${196+Math.floor(Math.sin(w.ph)*20)},120,${.38+.05*Math.sin(t/2300+w.ph)})`;
+    ctx.fillRect(w.x,w.y,w.w,w.h);
+    if (w.curtain) { ctx.fillStyle = w.curtain; ctx.globalAlpha = .55; ctx.fillRect(w.x,w.y,w.w*.3,w.h); ctx.fillRect(w.x+w.w*.7,w.y,w.w*.3,w.h); ctx.globalAlpha = 1; }
+  }
+  // laundry on the mint house balcony
+  ctx.strokeStyle = "#444"; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(-6,96); ctx.quadraticCurveTo(60,106,126,96); ctx.stroke();
+  LAUNDRY.forEach(([c,i])=>{ const x = 8+i*24, sw = Math.sin(t/700+i)*2.5;
+    ctx.save(); ctx.translate(x, 99+Math.sin(i)*2); ctx.rotate(sw*.03); ctx.fillStyle = c;
+    if (i%2) { ctx.fillRect(-8,0,16,20); ctx.fillRect(-12,0,4,8); ctx.fillRect(8,0,4,8); } else { ctx.fillRect(-6,0,5,22); ctx.fillRect(1,0,5,22); ctx.fillRect(-6,0,12,6); }
+    ctx.restore(); });
+  // bougainvillea spilling over the pink house
+  for (const fl of FLOWERS){ ctx.fillStyle = fl.c; ctx.beginPath(); ctx.arc(fl.x + Math.sin(t/1100+fl.y)*.6, fl.y + Math.sin(t/900+fl.x)*.6, fl.r, 0, 7); ctx.fill(); }
+  // national flag on the tall cream house
+  { const px = 288, py = -36, fw = 30, fh = 20;
+    ctx.strokeStyle = "#9aa0a6"; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(px,py+30); ctx.lineTo(px-14,py-6); ctx.stroke();
+    ctx.fillStyle = "#c8102e"; ctx.beginPath(); ctx.moveTo(px-14,py-6);
+    for (let i=0;i<=10;i++){ const xx = px-14-i*fw/10, yy = py-6 + Math.sin(t/260 - i*.7)*2*(i/10); ctx.lineTo(xx, yy); }
+    for (let i=10;i>=0;i--){ const xx = px-14-i*fw/10, yy = py-6+fh + Math.sin(t/260 - i*.7)*2*(i/10); ctx.lineTo(xx, yy); }
+    ctx.closePath(); ctx.fill();
+    const cx = px-14-fw/2, cy = py-6+fh/2 + Math.sin(t/260 - 3.5)*1; ctx.fillStyle = "#ffcd00"; ctx.beginPath();
+    for (let i=0;i<10;i++){ const a = -Math.PI/2 + i*Math.PI/5, r = i%2 ? 2.6 : 6.2; ctx.lineTo(cx+Math.cos(a)*r, cy+Math.sin(a)*r); } ctx.closePath(); ctx.fill(); }
+  // vertical neon "NHÀ NGHỈ"
+  { const on = true, x = 760, y0 = -128;
+    ctx.fillStyle = "#1a1016"; rr(x-9,y0-8,18,98,3); ctx.fill();
+    ctx.save(); ctx.shadowColor = "#ff3b3b"; ctx.shadowBlur = on ? 12 : 0;
+    ctx.font = "700 12px 'Be Vietnam Pro', sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillStyle = on ? "#ffb3b3" : "#5a2a2a";
+    ["N","H","À"," ","N","G","H","Ỉ"].forEach((ch,i)=>{ if (ch !== " ") ctx.fillText(ch, x, y0+2+i*11); });
+    ctx.restore(); }
+  // café lightbox signs (floor above the tarp)
+  ctx.save(); ctx.shadowColor = "rgba(150,255,190,.45)"; ctx.shadowBlur = 18;
+  ctx.fillStyle = "#e9efe6"; ctx.fillRect(330,86,130,46);
+  ctx.fillStyle = "#1f6b45"; ctx.fillRect(460,80,170,58);
+  ctx.restore();
+  ctx.strokeStyle = "#164f33"; ctx.lineWidth = 2; ctx.strokeRect(330,86,130,46); ctx.strokeRect(460,80,170,58);
+  ctx.fillStyle = "#1f6b45"; ctx.beginPath(); ctx.arc(352,109,13,0,7); ctx.fill();
+  ctx.fillStyle = "#e9efe6"; ctx.beginPath(); ctx.ellipse(352,111,6,7,0,0,7); ctx.fill(); ctx.fillStyle = "#1f6b45"; ctx.fillRect(351,101,2,7);
+  signText("GIẢI KHÁT", 408, 102, "600 13px Oswald, sans-serif", "#1f6b45");
+  signText("ăn vặt · mì gói", 408, 120, "500 10px 'Be Vietnam Pro', sans-serif", "#3d5a48");
+  signText("CÀ PHÊ CÓC", 545, 102, "600 26px Oswald, sans-serif", "#ffffff");
+  signText("mở tới khuya · có wifi", 545, 126, "500 10.5px 'Be Vietnam Pro', sans-serif", "#ffe27a");
+  // café interior under the tarp
+  let g = ctx.createLinearGradient(0,160,0,330); g.addColorStop(0,"#6b4426"); g.addColorStop(1,"#2c1d16");
+  ctx.fillStyle = g; ctx.fillRect(268,160,426,170);
+  ctx.fillStyle = "#3d2a1c"; ctx.fillRect(284,236,170,5); ctx.fillRect(284,270,170,5);
+  for (let i=0;i<8;i++){ ctx.fillStyle = ["#c98b4a","#e5c28a","#8e5a33"][i%3]; rr(290+i*20,218,12,18,3); ctx.fill(); rr(292+i*20,253,10,17,3); ctx.fill(); }
+  ctx.fillStyle = "#cfe8ef"; ctx.globalAlpha = .55; rr(600,206,64,104,4); ctx.fill(); ctx.globalAlpha = 1;
+  ctx.strokeStyle = "#8aa7b2"; ctx.lineWidth = 3; rr(600,206,64,104,4); ctx.stroke();
+  for (let i=0;i<3;i++){ ctx.fillStyle = ["#e04a3a","#3a8de0","#f0c040"][i]; ctx.fillRect(608+i*19,224,9,22); ctx.fillRect(610+i*19,264,9,22); }
+  ctx.fillStyle = "#c6302a"; rr(470,272,40,26,2); ctx.fill();
+  ctx.fillStyle = `rgba(255,120,80,${.5+.2*f})`; ctx.beginPath(); ctx.arc(480,278,2.2,0,7); ctx.arc(500,278,2.2,0,7); ctx.fill();
+  for (const dx of [232,696]){ ctx.fillStyle = "#2f7a6a"; ctx.fillRect(dx,164,36,166); ctx.strokeStyle = "#1d5247"; ctx.lineWidth = 2; ctx.strokeRect(dx+5,172,26,64); ctx.strokeRect(dx+5,244,26,78); }
+  ctx.fillStyle = "#565467"; ctx.fillRect(268,152,426,12);
+  for (const s of SNACKS){ ctx.fillStyle = s.c; rr(s.x, s.y + Math.sin(t/800+s.x)*.8, 9, 15, 2); ctx.fill(); }
+  // --- electric pole + tangled wires (dây điện) ---
+  ctx.fillStyle = "#6b6a72"; ctx.fillRect(898,0,12,486);
+  ctx.fillStyle = "#57565e"; ctx.fillRect(886,26,36,5); ctx.fillRect(888,44,32,5);
+  ctx.fillStyle = "#7d7f86"; rr(910,58,24,30,2); ctx.fill();
+  ctx.strokeStyle = "#0c0c10"; ctx.lineWidth = 1.4;
+  for (let i=0;i<11;i++){ const y0 = 24+i*3.2, y1 = 30+i*6, sag = 24+i*4 + Math.sin(i*2.3)*8;
+    ctx.beginPath(); ctx.moveTo(904,y0); ctx.quadraticCurveTo(452,y1+sag+Math.sin(t/2000+i)*1.2,-10,y1); ctx.stroke(); }
+  for (let i=0;i<5;i++){ ctx.beginPath(); ctx.moveTo(904,28+i*4); ctx.quadraticCurveTo(935,46+i*6,970,34+i*5); ctx.stroke(); }
+  ctx.lineWidth = 2;
+  for (let i=0;i<4;i++){ ctx.beginPath(); ctx.ellipse(884,92+i*3,16-i*2,10-i,.3,0,7); ctx.stroke(); }
+  ctx.beginPath(); ctx.moveTo(880,60); ctx.bezierCurveTo(840,120,760,60,700,150); ctx.stroke();
+  // --- sidewalk ---
+  g = ctx.createLinearGradient(0,330,0,484); g.addColorStop(0,"#2c2836"); g.addColorStop(1,"#3a3445");
+  ctx.fillStyle = g; ctx.fillRect(0,330,LW,154);
+  ctx.strokeStyle = "rgba(0,0,0,.25)"; ctx.lineWidth = 1;
+  for (let y=352;y<484;y+=26){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(LW,y); ctx.stroke(); }
+  for (let x=0;x<LW;x+=52){ ctx.beginPath(); ctx.moveTo(x,330); ctx.lineTo(x-30,484); ctx.stroke(); }
+  g = ctx.createRadialGradient(480,330,20,480,360,360); g.addColorStop(0,"rgba(255,170,90,.22)"); g.addColorStop(1,"rgba(255,170,90,0)");
+  ctx.fillStyle = g; ctx.fillRect(0,330,LW,154);
+  // curb + road
+  ctx.fillStyle = "#57525f"; ctx.fillRect(0,484,LW,10);
+  ctx.fillStyle = "#2b2733"; ctx.fillRect(0,494,LW,2);
+  g = ctx.createLinearGradient(0,496,0,600); g.addColorStop(0,"#16141e"); g.addColorStop(1,"#0d0c14");
+  ctx.fillStyle = g; ctx.fillRect(0,496,LW,104);
+  ctx.fillStyle = "#0d0c14"; ctx.fillRect(0,599,LW,2000);
+  ctx.save(); ctx.globalCompositeOperation = "lighter";
+  g = ctx.createLinearGradient(0,496,0,600); g.addColorStop(0,"rgba(90,230,150,.2)"); g.addColorStop(1,"rgba(90,230,150,0)");
+  ctx.fillStyle = g; for (let i=0;i<6;i++){ ctx.fillRect(470+i*26 + Math.sin(t/300+i)*2,498,12,80-i%3*14); }
+  g = ctx.createLinearGradient(0,496,0,580); g.addColorStop(0,"rgba(255,180,90,.22)"); g.addColorStop(1,"rgba(255,180,90,0)");
+  ctx.fillStyle = g; for (let x=130;x<840;x+=46){ ctx.fillRect(x+Math.sin(t/260+x)*1.5,498,5,70); }
+  g = ctx.createLinearGradient(0,496,0,570); g.addColorStop(0,"rgba(255,60,50,.2)"); g.addColorStop(1,"rgba(255,60,50,0)");
+  ctx.fillStyle = g; ctx.fillRect(900,498,16,60); ctx.fillRect(20,498,14,50);
+  ctx.restore();
+  ctx.strokeStyle = "rgba(240,230,200,.35)"; ctx.lineWidth = 3; ctx.setLineDash([34,26]);
+  ctx.beginPath(); ctx.moveTo(0,556); ctx.lineTo(LW,556); ctx.stroke(); ctx.setLineDash([]);
+}
+
+function drawTarp(t){
+  ctx.save();
+  ctx.beginPath(); ctx.moveTo(108,158); ctx.lineTo(852,158); ctx.lineTo(872,212); ctx.lineTo(88,212); ctx.closePath(); ctx.clip();
+  for (let x=80;x<880;x+=36){ ctx.fillStyle = (x/36)%2<1 ? "#3d7ad1" : "#dfe6ef"; ctx.beginPath(); ctx.moveTo(x,158); ctx.lineTo(x+36,158); ctx.lineTo(x+44,212); ctx.lineTo(x+8,212); ctx.fill(); }
+  ctx.fillStyle = "rgba(0,0,0,.28)"; ctx.fillRect(80,158,800,12);
+  ctx.restore();
+  for (let x=88;x<872;x+=24){ ctx.fillStyle = ((x-88)/24)%2<1 ? "#3d7ad1" : "#dfe6ef"; ctx.beginPath(); ctx.arc(x+12,212,12,0,Math.PI); ctx.fill(); }
+  ctx.fillStyle = "rgba(200,225,255,.75)";
+  for (let x=100;x<872;x+=24){ const p = ((t/900 + x*.37)%1); ctx.beginPath(); ctx.arc(x, 224+p*6, 1.8, 0, 7); ctx.fill(); }
+  ctx.fillStyle = "#8b8a98"; ctx.fillRect(96,210,5,276); ctx.fillRect(860,210,5,276);
+  // no-parking sign on the left pole
+  ctx.fillStyle = "#c62828"; ctx.beginPath(); ctx.arc(98,262,15,0,7); ctx.fill(); ctx.fillStyle = "#2a5db0"; ctx.beginPath(); ctx.arc(98,262,11,0,7); ctx.fill();
+  ctx.strokeStyle = "#c62828"; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(90,254); ctx.lineTo(106,270); ctx.stroke();
+  ctx.strokeStyle = "#222"; ctx.lineWidth = 1.3; ctx.beginPath();
+  const pts = [];
+  for (let x=110;x<=850;x+=4){ const s = Math.sin((x-110)/740*Math.PI*4); pts.push([x, 244 - Math.abs(s)*10]); }
+  pts.forEach(([x,y],i)=> i ? ctx.lineTo(x,y) : ctx.moveTo(x,y)); ctx.stroke();
+  for (let i=0;i<pts.length;i+=10){ const [x,y] = pts[i]; const fl = .82 + .18*Math.sin(t/300 + i);
+    const g = ctx.createRadialGradient(x,y+5,0,x,y+5,22); g.addColorStop(0,`rgba(255,200,110,${.55*fl})`); g.addColorStop(1,"rgba(255,200,110,0)");
+    ctx.fillStyle = g; ctx.fillRect(x-22,y-17,44,44);
+    ctx.fillStyle = `rgba(255,226,160,${fl})`; ctx.beginPath(); ctx.arc(x,y+5,3.4,0,7); ctx.fill(); }
+}
+
+const tv = { mode:"bongda", url:null, name:"", ytId:"" };
+const tvVideo = document.createElement("video");
+tvVideo.playsInline = true; tvVideo.loop = true; tvVideo.preload = "auto";
+let tvVol = .7;
+{ const v = store.get("qc.vt"); if (v !== null && Number.isFinite(Number(v))) tvVol = Math.max(0,Math.min(1,Number(v)/100)); }
+$("volTv").value = String(Math.round(tvVol*100));
+tvVideo.volume = tvVol;
+$("volTv").addEventListener("input", e => { tvVol = Number(e.target.value)/100; tvVideo.volume = tvVol; if (ytPlayer && ytReady) { ytPlayer.setVolume(Math.round(tvVol*100)); ytPlayer.unMute(); } store.set("qc.vt", e.target.value); });
+const tvStatus = $("tvStatus");
+function ytIdFrom(u){
+  const m = String(u).trim().match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*&)?v=|shorts\/|embed\/|live\/))([A-Za-z0-9_-]{11})/);
+  return m ? m[1] : "";
+}
+function stopVideo(){ try { tvVideo.pause(); } catch(e){} }
+function playFile(f){
+  if (!f || !/^video\//.test(f.type || "video/")) { tvStatus.textContent = "File này không phải video. Chọn file .mp4 nha."; return; }
+  stopYt(false);
+  if (tv.url) URL.revokeObjectURL(tv.url);
+  tv.url = URL.createObjectURL(f); tv.name = f.name; tv.mode = "video";
+  tvVideo.src = tv.url; tvVideo.volume = tvVol;
+  tvVideo.play().then(()=>{ tvStatus.textContent = `Đang chiếu: ${f.name} (chỉ màn hình của bạn thấy).`; })
+    .catch(()=>{ tvStatus.textContent = "Máy không phát được file này. Thử file .mp4 khác nha."; tv.mode = "bongda"; });
+  ownerSay("Ủa ai đổi kênh dzậy, coi gì hay hông chỉ em coi với!");
+}
+$("tvFile").addEventListener("change", e => { const f = e.target.files && e.target.files[0]; if (f) playFile(f); e.target.value = ""; });
+{ let depth = 0; const dh = $("dropHint");
+  const isFile = e => e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files");
+  stage.addEventListener("dragenter", e => { if (!isFile(e)) return; e.preventDefault(); depth++; dh.hidden = false; });
+  stage.addEventListener("dragover", e => { if (!isFile(e)) return; e.preventDefault(); });
+  stage.addEventListener("dragleave", () => { depth = Math.max(0, depth-1); if (!depth) dh.hidden = true; });
+  stage.addEventListener("drop", e => { if (!isFile(e)) return; e.preventDefault(); depth = 0; dh.hidden = true; const f = e.dataTransfer.files && e.dataTransfer.files[0]; if (f) playFile(f); });
+}
+$("tvBongda").addEventListener("click", () => { stopVideo(); stopYt(true); tv.mode = "bongda"; tvStatus.textContent = "TV đang chiếu bóng đá."; });
+$("tvOff").addEventListener("click", () => { stopVideo(); stopYt(true); tv.mode = "off"; tvStatus.textContent = "TV đã tắt."; });
+// ---- YouTube on the TV, shared by everyone in the café ----
+const ytBox = $("ytBox"); let ytPlayer = null, ytReady = false, ytApiP = null, ytCur = "";
+function ytIdFrom(u){ const m = String(u).trim().match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*&)?v=|shorts\/|embed\/|live\/))([A-Za-z0-9_-]{11})/); return m ? m[1] : ""; }
+function loadYtApi(){
+  if (ytApiP) return ytApiP;
+  ytApiP = new Promise(res => { if (window.YT && window.YT.Player) return res(); const prev = window.onYouTubeIframeAPIReady; window.onYouTubeIframeAPIReady = () => { if (prev) prev(); res(); };
+    const sc = document.createElement("script"); sc.src = "https://www.youtube.com/iframe_api"; document.head.append(sc); });
+  return ytApiP;
+}
+async function playYt(id, startSec){
+  stopVideo(); tv.mode = "yt"; tv.ytId = id; ytCur = id; ytBox.hidden = false;
+  tvStatus.textContent = "TV đang chiếu YouTube, cả quán xem chung.";
+  await loadYtApi();
+  if (ytCur !== id) return;
+  const start = Math.max(0, Math.floor(startSec || 0));
+  if (!ytPlayer) {
+    ytPlayer = new YT.Player("ytFrame", { width:356, height:200, videoId:id,
+      playerVars:{ autoplay:1, controls:0, playsinline:1, rel:0, modestbranding:1, start },
+      events:{ onReady: e => { ytReady = true; e.target.setVolume(Math.round(tvVol*100)); e.target.playVideo(); },
+               onError: () => { tvStatus.textContent = "Video này không cho phát nhúng ngoài YouTube. Thử link khác nha."; } } });
+  } else if (ytReady) { ytPlayer.loadVideoById({ videoId:id, startSeconds:start }); ytPlayer.setVolume(Math.round(tvVol*100)); }
+}
+function stopYt(shared){
+  ytCur = ""; ytBox.hidden = true;
+  if (ytPlayer && ytReady) { try { ytPlayer.stopVideo(); } catch(e){} }
+  if (shared && window.QC_SYNC) window.QC_SYNC.setTv(null);
+}
+function applyTvState(v, serverNow){
+  if (v && typeof v.id === "string" && /^[A-Za-z0-9_-]{11}$/.test(v.id)) { if (v.id !== ytCur) playYt(v.id, (serverNow - (Number(v.at)||serverNow))/1000); }
+  else if (tv.mode === "yt") { stopYt(false); tv.mode = "bongda"; tvStatus.textContent = "TV đang chiếu bóng đá."; }
+}
+$("ytForm").addEventListener("submit", e => {
+  e.preventDefault();
+  const id = ytIdFrom($("ytUrl").value);
+  if (!id) { tvStatus.textContent = "Link chưa đúng. Dán link dạng youtube.com/watch?v=… hoặc youtu.be/…"; return; }
+  $("ytUrl").value = "";
+  if (window.QC_SYNC) window.QC_SYNC.setTv(id).catch(() => playYt(id, 0)); else playYt(id, 0);
+  ownerSay("Dạ để em mở tivi cho cả quán coi nghen!");
+});
+document.addEventListener("pointerdown", () => { if (ytPlayer && ytReady) { try { ytPlayer.unMute(); } catch(e){} } }, { once:true });
+function positionYt(){
+  if (ytBox.hidden) return;
+  const k = TVW*view.scale/356;
+  ytBox.style.transform = `translate(${(TVX - view.off)*view.scale}px,${(TVY - view.offY)*view.scale}px) scale(${k})`;
+}
+const TVX = 470, TVY = 238, TVW = 120, TVH = 68;
+function drawTV(t){
+  ctx.strokeStyle = "#1a1a1f"; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(TVX+18,214); ctx.lineTo(TVX+18,TVY-4); ctx.moveTo(TVX+TVW-18,214); ctx.lineTo(TVX+TVW-18,TVY-4); ctx.stroke();
+  ctx.fillStyle = "#0b0b0f"; rr(TVX-5,TVY-5,TVW+10,TVH+12,4); ctx.fill();
+  ctx.save(); ctx.beginPath(); ctx.rect(TVX,TVY,TVW,TVH); ctx.clip();
+  let on = true;
+  if (tv.mode === "off") {
+    on = false; ctx.fillStyle = "#14161c"; ctx.fillRect(TVX,TVY,TVW,TVH);
+    ctx.fillStyle = "rgba(255,255,255,.06)"; ctx.beginPath(); ctx.moveTo(TVX+10,TVY); ctx.lineTo(TVX+40,TVY); ctx.lineTo(TVX+10,TVY+TVH); ctx.lineTo(TVX-20,TVY+TVH); ctx.fill();
+  } else if (tv.mode === "video" && tvVideo.readyState >= 2 && tvVideo.videoWidth) {
+    const vr = tvVideo.videoWidth / tvVideo.videoHeight, sr = TVW/TVH;
+    let sw = tvVideo.videoWidth, sh = tvVideo.videoHeight, sx = 0, sy = 0;
+    if (vr > sr) { sw = sh*sr; sx = (tvVideo.videoWidth - sw)/2; } else { sh = sw/sr; sy = (tvVideo.videoHeight - sh)/2; }
+    try { ctx.drawImage(tvVideo, sx, sy, sw, sh, TVX, TVY, TVW, TVH); } catch(e){ ctx.fillStyle = "#222"; ctx.fillRect(TVX,TVY,TVW,TVH); }
+  } else if (tv.mode === "yt" || tv.mode === "video") {
+    ctx.fillStyle = "#171b29"; ctx.fillRect(TVX,TVY,TVW,TVH);
+    const pulse = .85 + .15*Math.sin(t/300);
+    ctx.fillStyle = `rgba(230,60,60,${pulse})`; rr(TVX+TVW/2-15,TVY+14,30,21,6); ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.moveTo(TVX+TVW/2-5,TVY+19); ctx.lineTo(TVX+TVW/2+7,TVY+24.5); ctx.lineTo(TVX+TVW/2-5,TVY+30); ctx.closePath(); ctx.fill();
+    ctx.font = "500 8px 'Be Vietnam Pro', sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillStyle = "#d9deea";
+    ctx.fillText(tv.mode === "yt" ? "video đang mở ở tab mới" : "đang tải video…", TVX+TVW/2, TVY+48);
+    if (tv.mode === "yt") { ctx.fillStyle = "#8b93a8"; ctx.fillText(tv.ytId, TVX+TVW/2, TVY+58); }
+  } else {
+    // default channel: a football match
+    for (let i=0;i<9;i++){ ctx.fillStyle = i%2 ? "#2f8f40" : "#36a04a"; ctx.fillRect(TVX+i*TVW/9, TVY, TVW/9+1, TVH); }
+    ctx.strokeStyle = "rgba(255,255,255,.7)"; ctx.lineWidth = 1;
+    ctx.strokeRect(TVX+4,TVY+6,TVW-8,TVH-10);
+    ctx.beginPath(); ctx.moveTo(TVX+TVW/2,TVY+6); ctx.lineTo(TVX+TVW/2,TVY+TVH-4); ctx.stroke();
+    ctx.beginPath(); ctx.arc(TVX+TVW/2,TVY+TVH/2+1,10,0,7); ctx.stroke();
+    const P = [];
+    for (let i=0;i<10;i++){ const px = TVX+TVW/2 + Math.sin(t/1400 + i*1.7)*TVW*.38, py = TVY+TVH/2 + Math.cos(t/1800 + i*2.3)*TVH*.32; P.push([px,py]);
+      ctx.fillStyle = i < 5 ? "#e8312a" : "#f5d33a"; ctx.beginPath(); ctx.arc(px,py,2.3,0,7); ctx.fill(); }
+    const who = Math.floor(t/2200)%10, [bx,by] = P[who];
+    ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(bx+3,by+1,1.4,0,7); ctx.fill();
+    ctx.fillStyle = "rgba(0,0,0,.65)"; ctx.fillRect(TVX+3,TVY+2,34,9);
+    ctx.font = "600 7px Oswald, sans-serif"; ctx.textAlign = "left"; ctx.textBaseline = "middle"; ctx.fillStyle = "#fff"; ctx.fillText("VN 1 - 0 TL", TVX+5, TVY+6.8);
+  }
+  if (on) { ctx.fillStyle = "rgba(0,0,0,.12)"; for (let y=TVY; y<TVY+TVH; y+=3) ctx.fillRect(TVX,y,TVW,1); }
+  ctx.restore();
+  ctx.fillStyle = on ? "#4ade80" : "#ef4444"; ctx.beginPath(); ctx.arc(TVX+TVW-4,TVY+TVH+3.5,1.4,0,7); ctx.fill();
+  if (on) {
+    const flick = .8 + .2*Math.sin(t/140)*Math.sin(t/370);
+    ctx.save(); ctx.globalCompositeOperation = "lighter";
+    const g = ctx.createRadialGradient(TVX+TVW/2,TVY+TVH+10,0,TVX+TVW/2,TVY+TVH+10,140);
+    g.addColorStop(0,`rgba(120,170,255,${.14*flick})`); g.addColorStop(1,"rgba(120,170,255,0)");
+    ctx.fillStyle = g; ctx.fillRect(TVX-140,TVY+TVH,TVW+280,170); ctx.restore();
+  }
+}
+// ---------- cô Ba and her drinks cart ----------
+const OWNER_X = 206, CART_TOP = 352;
+function jar(x,y,w,h,fill,dots){
+  ctx.fillStyle = "rgba(235,245,250,.35)"; rr(x,y,w,h,3); ctx.fill();
+  ctx.fillStyle = fill; rr(x+1.5,y+h*.3,w-3,h*.68,2); ctx.fill();
+  if (dots) { for (let i=0;i<9;i++){ const dx = x+3+(i%3)*(w-6)/2, dy = y+h*.38+Math.floor(i/3)*h*.2; ctx.fillStyle = "#f6f2ea"; ctx.beginPath(); ctx.arc(dx,dy,2,0,7); ctx.fill(); ctx.fillStyle = "#2a1a12"; ctx.beginPath(); ctx.arc(dx,dy,.9,0,7); ctx.fill(); } }
+  ctx.fillStyle = "rgba(255,255,255,.35)"; ctx.fillRect(x+2,y+3,1.5,h-6);
+  ctx.fillStyle = "#f2b81f"; rr(x-1,y-4,w+2,5,1.5); ctx.fill();
+  ctx.fillStyle = "#d39a10"; ctx.fillRect(x-1,y-1,w+2,1);
+}
+function bottle(x,y,col,cap){
+  ctx.fillStyle = col; rr(x-3,y-15,6,15,1.5); ctx.fill(); ctx.fillRect(x-1.5,y-20,3,5);
+  ctx.fillStyle = cap; ctx.fillRect(x-2,y-22,4,2.5);
+  ctx.fillStyle = "rgba(255,255,255,.25)"; ctx.fillRect(x-2,y-13,1.2,10);
+}
+function drawCart(t){
+  const now = Date.now();
+  ownerFigure(OWNER_X, CART_TOP, t, now);
+  const x0 = 136, x1 = 268, w = x1-x0;
+  // left wing tray on a strut
+  ctx.strokeStyle = "#9aa1a9"; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(x0,384); ctx.lineTo(112,354); ctx.stroke();
+  ctx.fillStyle = "#b9bfc6"; rr(106,348,32,5,1); ctx.fill(); ctx.fillStyle = "#dfe3e7"; ctx.fillRect(106,348,32,1.5);
+  jar(110,326,12,22,"#2b1a14");              // sương sáo
+  jar(124,328,12,20,"rgba(236,232,222,.9)",true); // hạt é / thạch trứng
+  // cart body: brushed steel
+  let g = ctx.createLinearGradient(x0,0,x1,0); g.addColorStop(0,"#9aa1a9"); g.addColorStop(.35,"#d7dbe0"); g.addColorStop(.6,"#aab1b9"); g.addColorStop(1,"#cfd4d9");
+  ctx.fillStyle = g; rr(x0,CART_TOP+6,w,62,3); ctx.fill();
+  ctx.fillStyle = "rgba(0,0,0,.12)"; ctx.fillRect(x0,CART_TOP+44,w,1.5);
+  // red sign panel
+  ctx.fillStyle = "#c9232b"; rr(x0+10,CART_TOP+11,w-20,31,2); ctx.fill();
+  ctx.fillStyle = "rgba(255,255,255,.08)"; ctx.fillRect(x0+10,CART_TOP+11,w-20,8);
+  signText("NƯỚC MÁT CÔ BA", (x0+x1)/2, CART_TOP+21, "700 10px 'Be Vietnam Pro', sans-serif", "#ffd84a");
+  signText("sâm · đá me · trà đào · cà phê", (x0+x1)/2, CART_TOP+34, "500 7px 'Be Vietnam Pro', sans-serif", "#ffe9a8");
+  // frame + wheels
+  ctx.strokeStyle = "#7d848c"; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.moveTo(x0+6,CART_TOP+68); ctx.lineTo(x0+10,CART_TOP+74); ctx.moveTo(x1-6,CART_TOP+68); ctx.lineTo(x1-10,CART_TOP+74); ctx.stroke();
+  ctx.fillStyle = "#121216"; ctx.beginPath(); ctx.arc(x0+12,CART_TOP+76,8,0,7); ctx.arc(x1-12,CART_TOP+76,8,0,7); ctx.fill();
+  ctx.fillStyle = "#6c7076"; ctx.beginPath(); ctx.arc(x0+12,CART_TOP+76,3,0,7); ctx.arc(x1-12,CART_TOP+76,3,0,7); ctx.fill();
+  // counter top with a few round holes
+  g = ctx.createLinearGradient(0,CART_TOP-2,0,CART_TOP+7); g.addColorStop(0,"#eef1f4"); g.addColorStop(1,"#a5acb4");
+  ctx.fillStyle = g; rr(x0-4,CART_TOP-1,w+8,8,2); ctx.fill();
+  for (let i=0;i<4;i++){ ctx.fillStyle = "#3a3f46"; ctx.beginPath(); ctx.ellipse(x0+70+i*12,CART_TOP+2.5,4,1.6,0,0,7); ctx.fill(); }
+  // spaced-out things on top
+  for (let i=0;i<6;i++){ ctx.fillStyle = `rgba(240,246,250,${.5+i*.05})`; rr(x0+4,CART_TOP-6-i*5,13,6,1); ctx.fill(); }   // stack of cups
+  bottle(x0+28,CART_TOP-1,"#2a140c","#f4f4f4"); bottle(x0+38,CART_TOP-1,"#2a140c","#f4f4f4"); bottle(x0+48,CART_TOP-1,"#d0322b","#f2c230");
+  ctx.fillStyle = "rgba(235,245,250,.4)"; rr(x0+62,CART_TOP-14,10,13,1.5); ctx.fill();            // cup of straws
+  const straws = ["#ff8fb1","#ffd36a","#ff8fb1","#9fe0ff","#ff8fb1"];
+  straws.forEach((c,i)=>{ ctx.strokeStyle = c; ctx.lineWidth = 1.3; ctx.beginPath(); ctx.moveTo(x0+67,CART_TOP-6); ctx.lineTo(x0+60+i*3.5,CART_TOP-28+Math.abs(i-2)*2); ctx.stroke(); });
+  jar(x1-42,CART_TOP-23,15,21,"#3fbf5a");      // thạch lá dứa
+  jar(x1-22,CART_TOP-23,15,21,"#f08a3c");      // thạch dừa đỏ cam
+}
+function ownerFigure(x,y,t,now){
+  const sway = reduce ? 0 : Math.sin(t/900)*1.2, tilt = reduce ? 0 : Math.sin(t/2300)*.05;
+  const talking = now - owner.at < 2600, serving = now - owner.at < 1600;
+  const hx = x + sway, hy = y - 80;
+  // nón lá hanging on her back
+  ctx.fillStyle = "#e6d3a1"; ctx.beginPath(); ctx.arc(x+16, y-50, 24, 0, 7); ctx.fill();
+  ctx.strokeStyle = "rgba(140,105,50,.35)"; ctx.lineWidth = 1; for (let r=6;r<24;r+=5){ ctx.beginPath(); ctx.arc(x+16,y-50,r,0,7); ctx.stroke(); }
+  // long hair behind the shoulders
+  ctx.fillStyle = "#15111a"; ctx.beginPath(); ctx.moveTo(hx-13,hy-2); ctx.quadraticCurveTo(hx-18,hy+30,hx-14,hy+44); ctx.lineTo(hx+14,hy+44); ctx.quadraticCurveTo(hx+18,hy+30,hx+13,hy-2); ctx.closePath(); ctx.fill();
+  // áo bà ba (pink), long sleeves
+  ctx.fillStyle = "#f29ab6"; rr(x-16,y-62,32,64,11); ctx.fill();
+  ctx.fillStyle = "rgba(170,60,100,.18)"; ctx.fillRect(x-16,y-30,32,2);
+  ctx.fillStyle = "#fbe3ea"; for (let i=0;i<4;i++){ ctx.beginPath(); ctx.arc(x+1,y-46+i*9,1.3,0,7); ctx.fill(); }
+  // khăn rằn around the neck, one end hanging
+  const check = (cx,cy,cw,ch) => { ctx.fillStyle = "#f4f1ea"; ctx.fillRect(cx,cy,cw,ch); ctx.fillStyle = "#1b1b20";
+    for (let yy=0; yy<ch; yy+=3) for (let xx=((yy/3)%2)*3; xx<cw; xx+=6) ctx.fillRect(cx+xx, cy+yy, 3, 3); };
+  check(x-12,y-64,24,6); check(x-11,y-60,6,22);
+  // arms: one rests on the counter, the other lifts a cup while serving
+  ctx.lineCap = "round"; ctx.strokeStyle = "#f29ab6"; ctx.lineWidth = 7;
+  ctx.beginPath(); ctx.moveTo(x-13,y-50); ctx.lineTo(x-20,y-6); ctx.stroke();
+  const lift = serving ? Math.min(1, (1600-(now-owner.at))/400) : 0;
+  const ax = x+20 + lift*6, ay = y-8 - lift*30;
+  ctx.beginPath(); ctx.moveTo(x+13,y-50); ctx.lineTo(ax,ay); ctx.stroke();
+  ctx.fillStyle = "#f2c9a6"; ctx.beginPath(); ctx.arc(x-20,y-5,3.2,0,7); ctx.arc(ax,ay,3.2,0,7); ctx.fill();
+  if (lift > .2) { ctx.fillStyle = "rgba(240,246,250,.8)"; rr(ax-4,ay-14,8,11,1.5); ctx.fill(); ctx.fillStyle = "#9b6a42"; ctx.fillRect(ax-3,ay-10,6,6); ctx.strokeStyle = "#ff8fb1"; ctx.lineWidth = 1.2; ctx.beginPath(); ctx.moveTo(ax+1,ay-13); ctx.lineTo(ax+3,ay-20); ctx.stroke(); }
+  // head
+  ctx.save(); ctx.translate(hx, hy); ctx.rotate(tilt);
+  ctx.fillStyle = "#f2c9a6"; ctx.beginPath(); ctx.ellipse(0,0,11.5,12.5,0,0,7); ctx.fill();
+  ctx.fillStyle = "#15111a"; ctx.beginPath(); ctx.arc(0,-2,13,Math.PI*1.02,Math.PI*1.98); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(-12,-4); ctx.quadraticCurveTo(-2,-12,8,-6); ctx.quadraticCurveTo(2,-3,-6,0); ctx.closePath(); ctx.fill();   // side-swept bangs
+  ctx.fillRect(-13,-3,3,18); ctx.fillRect(10,-3,3,18);
+  const blink = (Math.floor(t/3800) % 2 === 0) && (t % 3800) < 130;
+  ctx.strokeStyle = "#2a1c18"; ctx.fillStyle = "#2a1c18"; ctx.lineWidth = 1.4;
+  if (blink || talking) { ctx.beginPath(); ctx.arc(-4.5,1,2.4,Math.PI*1.1,Math.PI*1.9); ctx.stroke(); ctx.beginPath(); ctx.arc(4.5,1,2.4,Math.PI*1.1,Math.PI*1.9); ctx.stroke(); }
+  else { ctx.beginPath(); ctx.ellipse(-4.5,1,1.5,2,0,0,7); ctx.ellipse(4.5,1,1.5,2,0,0,7); ctx.fill(); ctx.fillStyle = "#fff"; ctx.fillRect(-4,0,.8,.8); ctx.fillRect(5,0,.8,.8); }
+  ctx.fillStyle = "rgba(240,110,130,.45)"; ctx.beginPath(); ctx.ellipse(-7,5,2.8,1.6,0,0,7); ctx.ellipse(7,5,2.8,1.6,0,0,7); ctx.fill();
+  if (talking && Math.floor(t/130) % 2) { ctx.fillStyle = "#a83a4a"; ctx.beginPath(); ctx.ellipse(0,7,2,1.8,0,0,7); ctx.fill(); }
+  else { ctx.strokeStyle = "#a83a4a"; ctx.lineWidth = 1.2; ctx.beginPath(); ctx.arc(0,5.5,2.6,.2,Math.PI-.2); ctx.stroke(); }
+  ctx.restore();
+}
+// wooden đẩu stool, like the classic sidewalk café
+function woodStool(x,y,hl){
+  ctx.fillStyle = "#6e4a24"; ctx.fillRect(x-8,y+3,3,25); ctx.fillRect(x+5,y+3,3,25);
+  ctx.fillStyle = "#a8763d"; ctx.fillRect(x-13,y+3,4,26); ctx.fillRect(x+9,y+3,4,26);
+  ctx.fillRect(x-12,y+17,24,3);
+  ctx.fillStyle = "#d3a465"; rr(x-15,y-2,30,6,1.5); ctx.fill();
+  ctx.fillStyle = "rgba(255,255,255,.18)"; ctx.fillRect(x-14,y-2,28,1.5);
+  if (hl) { ctx.strokeStyle = "rgba(255,184,92,.95)"; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.ellipse(x,y+12,24,22,0,0,7); ctx.stroke(); }
+}
+function woodTable(tx,ty,baseY){
+  ctx.fillStyle = "#7a5228"; ctx.fillRect(tx-14,ty+2,3,baseY-ty-2); ctx.fillRect(tx+11,ty+2,3,baseY-ty-2);
+  ctx.fillStyle = "#a8763d"; ctx.fillRect(tx-21,ty+2,4,baseY-ty-1); ctx.fillRect(tx+17,ty+2,4,baseY-ty-1);
+  ctx.fillRect(tx-20,ty+20,40,3);
+  ctx.fillStyle = "#d3a465"; rr(tx-24,ty-2,48,6,1.5); ctx.fill();
+  ctx.fillStyle = "#c8352e"; rr(tx-21,ty-3,42,3.5,1); ctx.fill();
+}
+function plasticStool(x,y,hl){
+  ctx.fillStyle = "#d8322b"; ctx.beginPath(); ctx.moveTo(x-14,y+2); ctx.lineTo(x+14,y+2); ctx.lineTo(x+17,y+28); ctx.lineTo(x-17,y+28); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "rgba(25,12,14,.7)"; ctx.beginPath(); ctx.moveTo(x-8,y+28); ctx.lineTo(x-7,y+15); ctx.quadraticCurveTo(x,y+9,x+7,y+15); ctx.lineTo(x+8,y+28); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "rgba(0,0,0,.18)"; ctx.beginPath(); ctx.moveTo(x+9,y+2); ctx.lineTo(x+14,y+2); ctx.lineTo(x+17,y+28); ctx.lineTo(x+12,y+28); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "#ef4a3f"; rr(x-16,y-3,32,6,2); ctx.fill();
+  ctx.fillStyle = "rgba(255,255,255,.25)"; ctx.fillRect(x-14,y-2.5,28,1.5);
+  if (hl) { ctx.strokeStyle = "rgba(255,184,92,.95)"; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.ellipse(x,y+12,24,22,0,0,7); ctx.stroke(); }
+}
+function steelTable(tx,ty,baseY){
+  ctx.strokeStyle = "#6f757e"; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(tx-15,ty+3); ctx.lineTo(tx-17,baseY-2); ctx.moveTo(tx+15,ty+3); ctx.lineTo(tx+17,baseY-2); ctx.stroke();
+  ctx.strokeStyle = "#a3a9b2"; ctx.lineWidth = 2.6; ctx.beginPath(); ctx.moveTo(tx-22,ty+3); ctx.lineTo(tx-25,baseY); ctx.moveTo(tx+22,ty+3); ctx.lineTo(tx+25,baseY); ctx.stroke();
+  ctx.lineWidth = 1.6; ctx.beginPath(); ctx.moveTo(tx-23,ty+20); ctx.lineTo(tx+23,ty+20); ctx.stroke();
+  ctx.fillStyle = "#7d848e"; rr(tx-28,ty-3,56,7,1); ctx.fill();
+  ctx.fillStyle = "#b9c0c9"; ctx.fillRect(tx-28,ty-3,56,2.5);
+  // tube of chopsticks / straws like on the photo
+  ctx.fillStyle = "#c8ccd2"; rr(tx-3,ty-13,6,10,1); ctx.fill();
+  ctx.strokeStyle = "#5cb85c"; ctx.lineWidth = 1.2; for (let i=-2;i<=2;i+=2){ ctx.beginPath(); ctx.moveTo(tx+i*.8,ty-12); ctx.lineTo(tx+i*1.4,ty-19); ctx.stroke(); }
+}
+const plasticRow = ri => furnStyle === "nhua" || (furnStyle === "mix" && ri === 0);
+function stool(x,y,hl,ri){ if (plasticRow(ri)) plasticStool(x,y,hl); else woodStool(x,y,hl); }
+function lowTable(tx,ty,baseY,ri){ if (plasticRow(ri)) steelTable(tx,ty,baseY); else woodTable(tx,ty,baseY); }
+function glass(x,y,k,age){
+  const d = DRINKS[k]; if (!d) return;
+  const pop = age < 900 ? .6 + .4*(age/900) : 1;
+  ctx.save(); ctx.translate(x,y); ctx.scale(pop,pop);
+  if (k === "sting") {
+    ctx.fillStyle = d.fill; rr(-3.5,-18,7,18,2); ctx.fill(); ctx.fillRect(-2,-22,4,5);
+    ctx.fillStyle = "#f2d230"; ctx.fillRect(-2,-23,4,2); ctx.fillStyle = "rgba(255,255,255,.4)"; ctx.fillRect(-2.5,-15,1.5,12);
+  } else {
+    ctx.fillStyle = "rgba(230,240,250,.35)"; ctx.beginPath(); ctx.moveTo(-6,-17); ctx.lineTo(6,-17); ctx.lineTo(5,0); ctx.lineTo(-5,0); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = d.fill; ctx.beginPath(); ctx.moveTo(-5.4,-12); ctx.lineTo(5.4,-12); ctx.lineTo(4.6,-1); ctx.lineTo(-4.6,-1); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = d.top; ctx.fillRect(-5.4,-12,10.8,2.2);
+    if (k !== "den") { ctx.fillStyle = "rgba(255,255,255,.7)"; ctx.fillRect(-3.5,-11,3,3); ctx.fillRect(0.8,-9,3,3); }
+    ctx.strokeStyle = k==="suachua" ? "#e05a7a" : "#e8e8e8"; ctx.lineWidth = 1.2; ctx.beginPath(); ctx.moveTo(1.5,-10); ctx.lineTo(4,-22); ctx.stroke();
+  }
+  ctx.restore();
+  sparkle(x,y,age);
+}
+function sparkle(x,y,age){
+  if (age >= 1300) return; const a = 1-age/1300; ctx.fillStyle = `rgba(255,220,140,${a})`;
+  for (let i=0;i<5;i++){ const an = i*1.26 + age/300; ctx.beginPath(); ctx.arc(x+Math.cos(an)*(10+age/60), y-10+Math.sin(an)*(10+age/60), 1.8, 0, 7); ctx.fill(); }
+}
+function foodItem(x,y,k,age,t){
+  const pop = age < 900 ? .6 + .4*(age/900) : 1;
+  ctx.save(); ctx.translate(x,y); ctx.scale(pop,pop);
+  if (k === "mi") {
+    ctx.fillStyle = "#f2efe8"; ctx.beginPath(); ctx.moveTo(-9,-7); ctx.lineTo(9,-7); ctx.quadraticCurveTo(8,0,0,0); ctx.quadraticCurveTo(-8,0,-9,-7); ctx.fill();
+    ctx.fillStyle = "#e9c46a"; ctx.beginPath(); ctx.ellipse(0,-7,9,2.6,0,0,7); ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.ellipse(2,-7.5,4,1.8,0,0,7); ctx.fill(); ctx.fillStyle = "#f4a020"; ctx.beginPath(); ctx.arc(2,-7.7,1.4,0,7); ctx.fill();
+    ctx.fillStyle = "#4caf50"; ctx.fillRect(-6,-8.5,3,1.2);
+    ctx.strokeStyle = "rgba(255,255,255,.3)"; ctx.lineWidth = 1.2;
+    for (let s=0;s<2;s++){ const o = ((t/40)+s*20)%30; ctx.beginPath(); ctx.moveTo(-2+s*4,-10-o*.3); ctx.quadraticCurveTo(-5+s*4,-16-o*.4,-1+s*4,-22-o*.4); ctx.stroke(); }
+  } else if (k === "banhmi") {
+    ctx.fillStyle = "#e9e3d6"; ctx.beginPath(); ctx.ellipse(0,-1.5,10,2.4,0,0,7); ctx.fill();
+    ctx.fillStyle = "#d9963e"; ctx.beginPath(); ctx.ellipse(0,-5,9,3.6,-.08,0,7); ctx.fill();
+    ctx.fillStyle = "#fff6d9"; ctx.fillRect(-6,-6,9,1.5); ctx.fillStyle = "#f4a020"; ctx.beginPath(); ctx.arc(-1,-5.5,1.2,0,7); ctx.fill();
+    ctx.strokeStyle = "rgba(120,60,10,.6)"; ctx.lineWidth = .8; for (let i=-5;i<6;i+=3.5){ ctx.beginPath(); ctx.moveTo(i,-8); ctx.lineTo(i+2,-6.5); ctx.stroke(); }
+  } else if (k === "btt") {
+    ctx.fillStyle = "rgba(240,245,255,.45)"; ctx.beginPath(); ctx.moveTo(-6,0); ctx.lineTo(6,0); ctx.lineTo(4,-12); ctx.lineTo(-4,-12); ctx.closePath(); ctx.fill();
+    for (let i=0;i<9;i++){ ctx.fillStyle = ["#e86a2c","#f2c14e","#5fa84a","#fff","#b5401f"][i%5]; ctx.fillRect(-4+(i*3)%8,-9+(i%3)*3,2,2); }
+    ctx.fillStyle = "#e33"; ctx.fillRect(-1,-14,2,3);
+  } else if (k === "trung") {
+    ctx.strokeStyle = "#c7a76a"; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(-9,-3); ctx.lineTo(9,-6); ctx.stroke();
+    ctx.fillStyle = "#c98a4b"; ctx.beginPath(); ctx.ellipse(-3,-4,3.6,4.4,.2,0,7); ctx.fill(); ctx.beginPath(); ctx.ellipse(4,-5.2,3.6,4.4,.2,0,7); ctx.fill();
+    ctx.fillStyle = "rgba(40,20,10,.4)"; ctx.fillRect(-4,-6,1.5,1.5); ctx.fillRect(3,-7,1.5,1.5);
+  } else if (k === "hd") {
+    ctx.fillStyle = "#e6e2da"; ctx.beginPath(); ctx.ellipse(0,-1.5,9,2.6,0,0,7); ctx.fill();
+    for (let i=0;i<14;i++){ ctx.fillStyle = i%3 ? "#2b2622" : "#e9e2d0"; ctx.beginPath(); ctx.ellipse(-6+(i*7)%12, -3-(i%4)*.9, 1.4, .8, i, 0, 7); ctx.fill(); }
+  }
+  ctx.restore();
+  sparkle(x,y,age);
+}
+function drawArm(ax,ay,bx,by,sleeve,top,SK){
+  ctx.lineCap = "round"; ctx.lineWidth = 6;
+  const mx = ax+(bx-ax)*sleeve, my = ay+(by-ay)*sleeve;
+  if (sleeve > 0) { ctx.strokeStyle = top; ctx.beginPath(); ctx.moveTo(ax,ay); ctx.lineTo(mx,my); ctx.stroke(); }
+  if (sleeve < 1) { ctx.strokeStyle = SK; ctx.lineWidth = 5; ctx.beginPath(); ctx.moveTo(mx,my); ctx.lineTo(bx,by); ctx.stroke(); }
+  ctx.fillStyle = SK; ctx.beginPath(); ctx.arc(bx,by,2.8,0,7); ctx.fill();
+}
+const ease = k => k < .25 ? k/.25 : k > .8 ? (1-k)/.2 : 1;
+function person(p,s,t){
+  const now = Date.now(), st = actState(p, now);
+  const x = s.x, y = s.y, ph = (p.key.length*37 + s.x)%100;
+  let b = reduce ? 0 : Math.sin(t/900 + ph)*.9;
+  const h = p.hue, of = p.outfit || "thun";
+  const SK = ["#e7bf9a","#d9a77c","#c18a5d"][Math.floor(h/120)%3];
+  let top, pants, shin, feet, sleeve;
+  switch (of) {
+    case "baloi":   top = Math.floor(h)%2 ? "#ecebe6" : `hsl(${h} 35% 45%)`; pants = `hsl(${(h+150)%360} 30% 38%)`; shin = SK; feet = "dep"; sleeve = 0; break;
+    case "somi":    top = `hsl(${h} 35% 84%)`; pants = "#2a2c36"; shin = pants; feet = "shoe"; sleeve = .62; break;
+    case "hocsinh": top = "#f3f3ef"; pants = "#1f2a4a"; shin = pants; feet = "shoe"; sleeve = .42; break;
+    case "dobo":    top = `hsl(${h} 55% 72%)`; pants = top; shin = top; feet = "dep"; sleeve = .42; break;
+    case "shipper": top = "#e8742c"; pants = "#3a5a8a"; shin = pants; feet = "shoe"; sleeve = 1; break;
+    default:        top = `hsl(${h} 42% 52%)`; pants = "#36507a"; shin = pants; feet = "shoe"; sleeve = .42;
+  }
+  const dot = `hsl(${(h+40)%360} 65% 48%)`;
+  const kx = s.side < 0 ? 4 : -4, ad = s.side < 0 ? 1 : -1;
+  const a = st ? st.a : "", age = st ? st.age : 0, e = st ? ease(st.k) : 0;
+  if (a === "cuoi") b -= Math.abs(Math.sin(age/70))*2.5*e;
+  // idle leg jiggle for the bare-legged regulars (rung đùi)
+  const jig = (of === "baloi" && !reduce) ? Math.sin(t/55 + ph)*1.2 : 0;
+  if (of === "hocsinh") { ctx.fillStyle = `hsl(${h} 45% 38%)`; rr(x - ad*20 - 6, y-42+b, 12, 30, 4); ctx.fill(); }
+  // legs
+  ctx.fillStyle = pants; rr(x-12,y-6,24,9,4); ctx.fill();
+  ctx.fillStyle = shin; ctx.fillRect(x-12+kx,y+jig,8,26-jig); ctx.fillRect(x+4+kx,y,8,26);
+  if (of === "baloi") { ctx.fillStyle = pants; ctx.fillRect(x-12+kx,y,8,5); ctx.fillRect(x+4+kx,y,8,5); }
+  if (feet === "shoe") { ctx.fillStyle = "#151520"; ctx.fillRect(x-14+kx,y+24,11,4); ctx.fillRect(x+3+kx,y+24,11,4); }
+  else { ctx.fillStyle = SK; ctx.fillRect(x-14+kx,y+25,11,3); ctx.fillRect(x+3+kx,y+25,11,3);
+    ctx.fillStyle = of === "dobo" ? "#d23b6a" : "#3a6fc0"; ctx.fillRect(x-14+kx,y+27,11,2); ctx.fillRect(x+3+kx,y+27,11,2); }
+  if (of === "dobo") { ctx.fillStyle = dot; for (let i=0;i<4;i++){ ctx.beginPath(); ctx.arc(x-8+kx+(i%2)*16, y+6+Math.floor(i/2)*10, 1.6, 0, 7); ctx.fill(); } }
+  // upper body sways when dancing
+  ctx.save();
+  if (a === "nhay") { ctx.translate(Math.sin(age/170)*4*e, -Math.abs(Math.sin(age/170))*2*e); }
+  const sh = { ax: x+10*ad, ay: y-36+b, ox: x-10*ad };
+  const backArm = (hx,hy) => drawArm(sh.ox, sh.ay, hx, hy, sleeve, top, SK);
+  // the far arm goes behind the body
+  if (a === "vay") backArm(x - ad*20 + Math.sin(age/90)*6, y-70+b);
+  if (a === "vuon") backArm(x - ad*9, y-80+b);
+  if (a === "nhay") backArm(x - ad*16, y-40+b + Math.sin(age/170)*-24);
+  if (a === "gai") backArm(x - ad*8, y-68+b + Math.sin(age/60)*1.5);
+  // torso
+  if (!sleeve) {
+    ctx.fillStyle = SK; rr(x-14,y-46+b,28,42,10); ctx.fill();
+    ctx.fillStyle = top; rr(x-10,y-42+b,20,38,7); ctx.fill();
+    ctx.strokeStyle = top; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(x-7,y-41+b); ctx.lineTo(x-8,y-46+b); ctx.moveTo(x+7,y-41+b); ctx.lineTo(x+8,y-46+b); ctx.stroke();
+  } else {
+    ctx.fillStyle = top; rr(x-14,y-46+b,28,42,10); ctx.fill();
+    ctx.fillStyle = "rgba(0,0,0,.14)"; rr(x-14,y-20+b,28,16,6); ctx.fill();
+  }
+  if (of === "somi" || of === "hocsinh") {
+    ctx.fillStyle = "#ffffff"; ctx.beginPath(); ctx.moveTo(x-6,y-46+b); ctx.lineTo(x,y-40+b); ctx.lineTo(x+6,y-46+b); ctx.lineTo(x+2,y-47+b); ctx.lineTo(x,y-43+b); ctx.lineTo(x-2,y-47+b); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "rgba(0,0,0,.25)"; for (let i=0;i<4;i++) ctx.fillRect(x-.5,y-38+i*7+b,1.5,1.5);
+    ctx.fillStyle = "#1a1a1a"; ctx.fillRect(x-14,y-7+b,28,2.5);
+    if (of === "hocsinh") { ctx.fillStyle = "#2d5fb5"; ctx.fillRect(x+3,y-38+b,8,3.5); }
+  }
+  if (of === "shipper") { ctx.fillStyle = "#f4f4f4"; ctx.fillRect(x-14,y-30+b,28,3); ctx.fillStyle = "rgba(0,0,0,.3)"; ctx.fillRect(x-.5,y-44+b,1.2,38); }
+  if (of === "thun") { ctx.fillStyle = "rgba(255,255,255,.28)"; rr(x-5,y-37+b,10,7,2); ctx.fill(); }
+  if (of === "dobo") { ctx.fillStyle = dot; for (let i=0;i<9;i++){ ctx.beginPath(); ctx.arc(x-9+(i%3)*9 + (Math.floor(i/3)%2)*3, y-40+Math.floor(i/3)*11+b, 1.8, 0, 7); ctx.fill(); } }
+  // head: laughing tips back, phone lights the face
+  const hy = y-57+b + (a === "cuoi" ? -1.5*e : 0) + (a === "dt" ? 2*e : 0);
+  ctx.fillStyle = SK; ctx.beginPath(); ctx.arc(x,hy,11,0,7); ctx.fill();
+  ctx.fillStyle = (p.nick === "Mike" || p.nick === "Sophie") ? "#c9a35a" : "#1d1a22";
+  if (p.g === "f") {
+    const style = Math.floor(h) % 3;
+    ctx.beginPath(); ctx.arc(x,hy-2,12.2,Math.PI*.98,Math.PI*2.02); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(x-11,hy-6); ctx.quadraticCurveTo(x-1,hy-12,x+9,hy-5); ctx.quadraticCurveTo(x+2,hy-3,x-5,hy-1); ctx.closePath(); ctx.fill();
+    if (style === 0) { ctx.fillRect(x-12.5,hy-3,4.5,22); ctx.fillRect(x+8,hy-3,4.5,22); }                         // long straight
+    else if (style === 1) { ctx.fillRect(x-12,hy-3,3.5,10); ctx.fillRect(x+8.5,hy-3,3.5,10); ctx.beginPath(); ctx.arc(x - ad*10, hy-8, 5, 0, 7); ctx.fill(); }  // bun
+    else { ctx.fillRect(x-12,hy-3,3.5,9); ctx.fillRect(x+8.5,hy-3,3.5,9); ctx.beginPath(); ctx.ellipse(x - ad*13, hy+6, 3.4, 10, ad*.25, 0, 7); ctx.fill(); }      // ponytail
+  }
+  else if (of === "baloi") { ctx.beginPath(); ctx.arc(x,hy-2,11.2,Math.PI*1.1,Math.PI*1.9); ctx.fill(); }
+  else { ctx.beginPath(); ctx.arc(x,hy-3,11.5,Math.PI*1.05,Math.PI*1.95); ctx.fill(); ctx.fillRect(x-11,hy-5,3,6); }
+  const look = a === "dt" ? ad*1 : s.side < 0 ? 2 : -2, eyeY = hy + (a === "dt" ? 1 : 0);
+  ctx.fillStyle = "#3a2a22";
+  if (a === "cuoi" || a === "ngap") { ctx.fillRect(x-4+look,eyeY,3,1); ctx.fillRect(x+2+look,eyeY,3,1); }
+  else { ctx.fillRect(x-4+look,eyeY,2,2); ctx.fillRect(x+2+look,eyeY,2,2); }
+  if (p.g === "f" && a !== "cuoi" && a !== "ngap") { ctx.fillStyle = "#c2475f"; ctx.fillRect(x-1.5+look,hy+5,3,1.3); ctx.fillStyle = "rgba(240,120,140,.35)"; ctx.beginPath(); ctx.arc(x-6+look,hy+3,2,0,7); ctx.arc(x+6+look,hy+3,2,0,7); ctx.fill(); }
+  if (a === "cuoi") { ctx.fillStyle = "#5a2020"; ctx.beginPath(); ctx.ellipse(x+look,hy+5,3.2,2.2*e+.5,0,0,Math.PI); ctx.fill(); }
+  if (a === "ngap") { ctx.fillStyle = "#5a2020"; ctx.beginPath(); ctx.ellipse(x+look,hy+5,2.4,3.4*e+.3,0,0,7); ctx.fill(); }
+  if (a === "dt") { const g = ctx.createRadialGradient(x+look,hy+2,0,x+look,hy+2,16); g.addColorStop(0,`rgba(140,190,255,${.35*e})`); g.addColorStop(1,"rgba(140,190,255,0)"); ctx.fillStyle = g; ctx.fillRect(x-18,hy-14,36,32); }
+  // the near arm: rests on the table unless doing something
+  let hx = x+18*ad, hyy = y-12+b, hold = false;
+  if (a === "uong") { hx = x+18*ad + (x+6*ad - (x+18*ad))*e; hyy = y-12+b + ((y-50+b) - (y-12+b))*e; hold = e > .3; }
+  else if (a === "cung") { hx = x+(18+10*e)*ad; hyy = y-12+b - 36*e; hold = true; }
+  else if (a === "ngap") { hx = x+(18-14*e)*ad; hyy = y-12+b - 38*e; }
+  else if (a === "vuon") { hx = x+(18-10*e)*ad; hyy = y-12+b - 68*e; }
+  else if (a === "nhay") { hyy = y-12+b - (Math.sin(age/170+Math.PI)*.5+.5)*26*e; hx = x+16*ad; }
+  else if (a === "dt") { hx = x+(18-14*e)*ad; hyy = y-12+b - 18*e; }
+  drawArm(sh.ax, sh.ay, hx, hyy, sleeve, top, SK);
+  if (a === "dt" && e > .2) { ctx.fillStyle = "#121218"; rr(hx-3,hyy-10,7,12,1.5); ctx.fill(); ctx.fillStyle = `rgba(130,185,255,${.9*e})`; ctx.fillRect(hx-2,hyy-9,5,9); }
+  if (hold && p.drink) { const d = DRINKS[p.drink]; ctx.fillStyle = d.fill; rr(hx-3,hyy-11,6,10,1.5); ctx.fill(); ctx.fillStyle = "rgba(255,255,255,.35)"; ctx.fillRect(hx-2,hyy-10,1.4,8); }
+  ctx.restore();
+  // little pop words above the head
+  const pop = a && ACTS[a].pop;
+  if (pop) {
+    const al = Math.min(1, e*1.4);
+    ctx.font = "700 12px 'Be Vietnam Pro', sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.globalAlpha = al; ctx.lineWidth = 3; ctx.strokeStyle = "rgba(10,12,20,.85)";
+    const px = x + ad*20 + (a === "nhay" ? Math.sin(age/200)*4 : 0), py = y - 62 - st.k*14;
+    ctx.strokeText(pop, px, py); ctx.fillStyle = a === "cung" ? "#ffd27a" : "#fff2c8"; ctx.fillText(pop, px, py);
+    ctx.globalAlpha = 1;
+  }
+}
+function drawRowTables(ri, occ, now, t){
+  for (const tx of ROWS[ri].tables){
+    const ty = ROWS[ri].y - 6;
+    lowTable(tx, ty, ROWS[ri].y+28, ri);
+    SEATS.forEach((s,i)=>{
+      if (s.row !== ri || s.tx !== tx) return;
+      const p = occ.get(i); if (!p) return;
+      if (p.food) foodItem(tx + s.side*6, ty-2, p.food, foodAge(p, now), t);
+      if (p.drink) glass(tx + s.side*17, ty-2, p.drink, servedAge(p, now));
+    });
+  }
+}
+function label(p,s,now){
+  const top = s.y - 74;
+  ctx.font = "600 11px 'Be Vietnam Pro', sans-serif";
+  const name = p.isYou ? `${p.nick} (bạn)` : p.sim ? `${p.nick} · AI` : p.nick;
+  const w = Math.min(64, ctx.measureText(name).width + 12);
+  ctx.fillStyle = p.isYou ? "rgba(255,184,92,.92)" : p.sim ? "rgba(24,28,44,.62)" : "rgba(14,17,30,.82)";
+  rr(s.x-w/2, top-8, w, 16, 8); ctx.fill();
+  ctx.fillStyle = p.isYou ? "#1b1206" : p.sim ? "#c9c2b6" : "#f2ead9";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.save(); ctx.beginPath(); ctx.rect(s.x-w/2+3, top-8, w-6, 16); ctx.clip(); ctx.fillText(name, s.x, top+.5); ctx.restore();
+}
+function bubble(text, x, bottom, age){
+  ctx.font = "500 12.5px 'Be Vietnam Pro', sans-serif";
+  const words = text.split(/\s+/), lines = []; let line = "";
+  for (const wd of words){ const tryL = line ? line+" "+wd : wd; if (ctx.measureText(tryL).width > 140 && line){ lines.push(line); line = wd; } else line = tryL; }
+  if (line) lines.push(line);
+  let L = lines.slice(0,3); if (lines.length > 3) L[2] = L[2].replace(/\s*\S*$/,"") + "…";
+  const lh = 16;
+  const w = Math.min(156, Math.max(...L.map(l=>ctx.measureText(l).width)) + 16), h = L.length*lh + 10;
+  const a = age < 250 ? age/250 : age > 11000 ? Math.max(0,(12000-age)/1000) : 1;
+  let bx = Math.max(view.off+4, Math.min(view.off+view.w-w-4, x-w/2)); const by = bottom - h;
+  if (tv.mode !== "off" && by < TVY+TVH+6 && bottom > TVY-6 && bx < TVX+TVW+6 && bx+w > TVX-6) bx = x < TVX+TVW/2 ? TVX-w-8 : TVX+TVW+8;
+  const tx = Math.max(bx+10, Math.min(bx+w-10, x));
+  ctx.globalAlpha = a;
+  ctx.fillStyle = "#f6eedf"; rr(bx,by,w,h,8); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(tx-5,bottom-.5); ctx.lineTo(tx+5,bottom-.5); ctx.lineTo(x,bottom+6); ctx.fill();
+  ctx.fillStyle = "#21180f"; ctx.textAlign = "left"; ctx.textBaseline = "top";
+  L.forEach((l,i)=> ctx.fillText(l, bx+8, by+5+i*lh));
+  ctx.globalAlpha = 1;
+}
+
+// ---------- vehicles ----------
+const VEH = [["xeso",42],["taxi",13],["bus",7],["cavien",10],["banhmi",8],["xichlo",10],["bagac",10]];
+const PONCHO = ["#3a7bd5","#e2574c","#f2c14e","#4fae7b","#9b6bd6","#ff8a3d"];
+const CART_LINES = { cavien:["Cá viên chiên đây!","Cá viên, bò viên nóng giòn đây!"], banhmi:["Bánh mì nóng giòn đây!","Bánh mì thịt, bánh mì trứng đây!"] };
+function pickType(){ let r = Math.random()*100; for (const [k,w] of VEH){ if ((r-=w) < 0) return k; } return "xeso"; }
+function spawnBike(force){
+  const type = force || pickType();
+  if (!force && (type==="cavien"||type==="banhmi") && bikes.some(b=>b.type===type)) return;
+  const dir = Math.random()<.5 ? 1 : -1;
+  const half = {bus:135, taxi:80, bagac:90}[type] || 60;
+  const laneY = dir > 0 ? 592 : 538, jitter = type === "xeso" ? (Math.random()-.5)*8 : 0;
+  const sx = dir > 0 ? -half-20 : LW+half+20;
+  if (bikes.some(b => b.dir === dir && Math.abs(b.x - sx) < b.half + half + 60)) return;
+  const v = {xeso:2.2+Math.random()*1.8, taxi:3.2+Math.random(), bus:1.8, cavien:.55, banhmi:.6, xichlo:.95, bagac:1.4}[type];
+  const b = { type, dir, x: sx, y: laneY + jitter, v, half,
+    poncho: rnd(PONCHO), color: rnd(["#b8322e","#2c5db3","#1e1e26","#7a7d86"]),
+    variant: rnd(["solo","solo","duo","family","cargo","jugs"]), ph: Math.random()*6, sayAt: 0, said: "",
+    honk: type==="taxi" || (type==="xeso" && Math.random()<.3) || (type==="bus" && Math.random()<.5) || (type==="bagac" && Math.random()<.3) };
+  if (CART_LINES[type]) b.sayAt = Date.now() + 1500 + Math.random()*2500;
+  bikes.push(b);
+}
+let nextBike = performance.now() + 1500;
+spawnBike("cavien"); bikes[0].x = bikes[0].dir > 0 ? 260 : 700; bikes[0].sayAt = Date.now() + 800;
+const PARKED = [{x:925,y:482,dir:-1,color:"#2c5db3",variant:"none"},{x:30,y:482,dir:1,color:"#b8322e",variant:"none"}];
+
+function lights(x,y,d,front,back,big){
+  ctx.save(); ctx.globalCompositeOperation = "lighter";
+  const cx = x + d*(front+60);
+  const g = ctx.createRadialGradient(cx,y,0,cx,y,big?130:95); g.addColorStop(0,"rgba(255,240,200,.32)"); g.addColorStop(1,"rgba(255,240,200,0)");
+  ctx.fillStyle = g; ctx.beginPath(); ctx.ellipse(cx,y+1,big?130:95,big?14:11,0,0,7); ctx.fill();
+  ctx.fillStyle = "rgba(255,60,60,.22)"; ctx.fillRect(x-d*back-3,y+2,6,26);
+  ctx.restore();
+}
+function wheel(x,y,r){ ctx.fillStyle = "#0b0b10"; ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.fill(); ctx.fillStyle = "#7d7f88"; ctx.beginPath(); ctx.arc(x,y,r*.38,0,7); ctx.fill(); }
+function rider(cx,seatY,color,s){
+  s = s || 1;
+  ctx.fillStyle = color; ctx.globalAlpha = .93;
+  ctx.beginPath(); ctx.moveTo(cx, seatY-50*s); ctx.lineTo(cx+28*s, seatY+4*s); ctx.lineTo(cx-26*s, seatY+8*s); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx+2*s, seatY-50*s, 9*s, 0, 7); ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = "#e0b48f"; ctx.beginPath(); ctx.arc(cx+6*s, seatY-49*s, 4.5*s, -1.2, 1.2); ctx.fill();
+  ctx.fillStyle = "rgba(255,255,255,.22)"; ctx.beginPath(); ctx.moveTo(cx+2*s,seatY-46*s); ctx.lineTo(cx+18*s,seatY-6*s); ctx.lineTo(cx+13*s,seatY-6*s); ctx.closePath(); ctx.fill();
+}
+function walker(x,t,ph,color){
+  const sw = Math.sin(t/160+ph)*6;
+  ctx.strokeStyle = "#2b2f45"; ctx.lineWidth = 5; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(x,-30); ctx.lineTo(x+sw,0); ctx.moveTo(x,-30); ctx.lineTo(x-sw,0); ctx.stroke();
+  ctx.fillStyle = color; ctx.globalAlpha = .93; ctx.beginPath(); ctx.moveTo(x,-74); ctx.lineTo(x+16,-26); ctx.lineTo(x-14,-24); ctx.closePath(); ctx.fill(); ctx.globalAlpha = 1;
+  ctx.strokeStyle = color; ctx.lineWidth = 5; ctx.beginPath(); ctx.moveTo(x+6,-52); ctx.lineTo(x+20,-52); ctx.stroke();
+  ctx.fillStyle = "#e0b48f"; ctx.beginPath(); ctx.arc(x+1,-78,7,0,7); ctx.fill();
+  ctx.fillStyle = "#e9d7a6"; ctx.beginPath(); ctx.moveTo(x-16,-80); ctx.lineTo(x+1,-96); ctx.lineTo(x+18,-80); ctx.closePath(); ctx.fill();
+}
+function xeso(b){
+  const c = b.color;
+  wheel(-26,-11,11); wheel(26,-11,11);
+  ctx.fillStyle = c; ctx.beginPath(); ctx.moveTo(-42,-22); ctx.quadraticCurveTo(-38,-38,-8,-36); ctx.lineTo(2,-22); ctx.lineTo(-30,-17); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "#16161c"; rr(-36,-42,32,7,3); ctx.fill();
+  ctx.strokeStyle = c; ctx.lineWidth = 6; ctx.lineCap = "round"; ctx.beginPath(); ctx.moveTo(-4,-22); ctx.lineTo(12,-24); ctx.stroke();
+  ctx.fillStyle = c; ctx.beginPath(); ctx.moveTo(10,-20); ctx.quadraticCurveTo(14,-44,24,-50); ctx.lineTo(29,-46); ctx.quadraticCurveTo(21,-30,19,-18); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = "#8a8c96"; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(25,-50); ctx.lineTo(27,-11); ctx.stroke();
+  ctx.fillStyle = c; rr(18,-60,17,9,3); ctx.fill();
+  ctx.fillStyle = b.variant === "none" ? "#8d8a7a" : "#fff6d0"; ctx.beginPath(); ctx.arc(35,-55,3.6,0,7); ctx.fill();
+  ctx.fillStyle = b.variant === "none" ? "#6a2020" : "#ff3a3a"; ctx.fillRect(-44,-30,4,4);
+  const v = b.variant;
+  if (v === "none") return;
+  if (v === "cargo") { ctx.fillStyle = "#eef0f2"; for (let i=0;i<3;i++){ rr(-56,-60-i*18,34,17,2); ctx.fill(); ctx.strokeStyle = "#b9bdc4"; ctx.lineWidth = 1; ctx.stroke(); } ctx.strokeStyle = "#d33"; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(-39,-112); ctx.lineTo(-39,-42); ctx.stroke(); }
+  if (v === "jugs") { ctx.fillStyle = "rgba(90,160,235,.85)"; for (let i=0;i<2;i++){ rr(-54,-66-i*26,30,24,8); ctx.fill(); } ctx.fillStyle = "#2a5fb0"; ctx.fillRect(-42,-120,6,6); }
+  if (v === "duo") { rider(-30,-42,b.poncho); rider(-12,-42,b.poncho); }
+  else if (v === "family") { rider(-34,-42,b.poncho,.95); rider(-14,-42,b.poncho); rider(14,-30,PONCHO[(PONCHO.indexOf(b.poncho)+2)%PONCHO.length],.5); }
+  else rider(-12,-42,b.poncho);
+}
+function taxi(){
+  ctx.fillStyle = "#2a8f4c"; ctx.beginPath(); ctx.moveTo(-44,-40); ctx.lineTo(-30,-64); ctx.lineTo(26,-64); ctx.lineTo(46,-40); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "#1b2a3a"; ctx.beginPath(); ctx.moveTo(-38,-42); ctx.lineTo(-27,-60); ctx.lineTo(-3,-60); ctx.lineTo(-3,-42); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(1,-42); ctx.lineTo(1,-60); ctx.lineTo(24,-60); ctx.lineTo(40,-42); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "rgba(255,190,120,.25)"; ctx.fillRect(4,-58,6,14);
+  ctx.fillStyle = "#33a65a"; rr(-72,-42,144,28,8); ctx.fill();
+  ctx.fillStyle = "#f1f1ec"; ctx.fillRect(-72,-31,144,4);
+  ctx.fillStyle = "#0b0b10"; ctx.beginPath(); ctx.arc(-46,-14,15,Math.PI,0); ctx.arc(46,-14,15,Math.PI,0); ctx.fill(); wheel(-46,-12,12); wheel(46,-12,12);
+  ctx.fillStyle = "#fff6d0"; ctx.fillRect(66,-36,6,6);
+  ctx.fillStyle = "#ff3a3a"; ctx.fillRect(-72,-38,4,7);
+  ctx.save(); ctx.shadowColor = "#ffcf6a"; ctx.shadowBlur = 10; ctx.fillStyle = "#ffd36a"; rr(-14,-75,28,11,2); ctx.fill(); ctx.restore();
+}
+function bus(){
+  ctx.fillStyle = "#2f9a5b"; rr(-128,-90,256,78,9); ctx.fill();
+  ctx.fillStyle = "#f2f1ea"; ctx.fillRect(-128,-50,256,9);
+  for (let i=0;i<7;i++){ const x = -116+i*32; ctx.fillStyle = "rgba(255,218,150,.78)"; rr(x,-84,26,24,3); ctx.fill();
+    if ((i*7+3)%3) { ctx.fillStyle = "rgba(40,30,30,.75)"; ctx.beginPath(); ctx.arc(x+13,-66,6,0,7); ctx.fill(); ctx.fillRect(x+6,-62,14,4); } }
+  ctx.fillStyle = "#1b2a3a"; rr(110,-84,14,42,3); ctx.fill();
+  ctx.fillStyle = "#11141c"; rr(-12,-84,4,70,1); ctx.fill(); rr(-6,-84,4,70,1); ctx.fill();
+  ctx.fillStyle = "#1b1b20"; rr(92,-88,30,8,2); ctx.fill();
+  ctx.fillStyle = "#0b0b10"; ctx.beginPath(); ctx.arc(-84,-14,16,Math.PI,0); ctx.arc(84,-14,16,Math.PI,0); ctx.fill(); wheel(-84,-13,13); wheel(84,-13,13);
+  ctx.fillStyle = "#fff6d0"; ctx.fillRect(122,-30,6,8);
+  ctx.fillStyle = "#ff3a3a"; ctx.fillRect(-128,-36,4,10);
+}
+function cart(b,t,kind){
+  walker(-40,t,b.ph,b.poncho);
+  wheel(-8,-8,8); wheel(42,-8,8);
+  ctx.strokeStyle = "#9a9ca6"; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(-22,-52); ctx.lineTo(-20,-30); ctx.stroke();
+  ctx.fillStyle = "#e6dfcf"; rr(-20,-60,70,40,3); ctx.fill();
+  ctx.fillStyle = "rgba(220,240,250,.32)"; ctx.fillRect(-20,-88,70,28);
+  ctx.strokeStyle = "#b8c2c8"; ctx.lineWidth = 2; ctx.strokeRect(-20,-88,70,28);
+  if (kind === "cavien") {
+    for (let i=0;i<5;i++){ const x = -12+i*12; ctx.strokeStyle = "#d8c48c"; ctx.lineWidth = 1.2; ctx.beginPath(); ctx.moveTo(x,-64); ctx.lineTo(x,-84); ctx.stroke();
+      ctx.fillStyle = i%2 ? "#b06a2e" : "#d9a35a"; for (let k=0;k<3;k++){ ctx.beginPath(); ctx.arc(x,-80+k*5,2.6,0,7); ctx.fill(); } }
+    ctx.fillStyle = "#1c1c22"; ctx.beginPath(); ctx.ellipse(58,-62,12,4,0,0,7); ctx.fill();
+    ctx.fillStyle = "#3a6fc0"; rr(-6,-34,12,14,4); ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,.28)"; ctx.lineWidth = 2;
+    for (let k=0;k<2;k++){ const o = (t/35+k*25)%40; ctx.beginPath(); ctx.moveTo(56+k*5,-66-o*.4); ctx.quadraticCurveTo(50+Math.sin(t/250+k)*5,-80-o*.5,58+k*5,-94-o*.6); ctx.stroke(); }
+  } else {
+    for (let i=0;i<4;i++){ ctx.fillStyle = "#d99a45"; ctx.beginPath(); ctx.ellipse(-8+i*16,-70,7,3.5,0,0,7); ctx.fill(); ctx.beginPath(); ctx.ellipse(-2+i*16,-79,7,3.5,0,0,7); ctx.fill(); }
+    ctx.fillStyle = "#9a3b2a"; ctx.fillRect(28,-58,14,8);
+  }
+  ctx.fillStyle = kind === "cavien" ? "#c9322a" : "#f0b52e"; rr(-24,-102,78,14,2); ctx.fill();
+  const g = ctx.createRadialGradient(15,-96,0,15,-96,40); g.addColorStop(0,"rgba(255,220,140,.4)"); g.addColorStop(1,"rgba(255,220,140,0)");
+  ctx.fillStyle = g; ctx.fillRect(-25,-136,80,80);
+}
+function xichlo(b,t){
+  wheel(30,-11,11); wheel(-34,-14,14);
+  ctx.strokeStyle = "#2a2a30"; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(-34,-14); ctx.lineTo(-22,-46); ctx.lineTo(8,-24); ctx.lineTo(30,-11); ctx.moveTo(-22,-46); ctx.lineTo(-30,-56); ctx.stroke();
+  ctx.fillStyle = "#8b2323"; rr(6,-46,42,22,6); ctx.fill();
+  ctx.fillStyle = "#a83030"; ctx.beginPath(); ctx.moveTo(6,-46); ctx.quadraticCurveTo(10,-82,40,-80); ctx.lineTo(42,-74); ctx.quadraticCurveTo(18,-72,14,-46); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "#3f6fb0"; rr(16,-66,20,22,6); ctx.fill();
+  ctx.fillStyle = "#e0b48f"; ctx.beginPath(); ctx.arc(28,-70,7,0,7); ctx.fill();
+  ctx.fillStyle = "#1d1a22"; ctx.beginPath(); ctx.arc(28,-73,7.5,Math.PI,0); ctx.fill();
+  const p = t/220 + b.ph;
+  ctx.strokeStyle = "#2b2f45"; ctx.lineWidth = 4; ctx.beginPath();
+  ctx.moveTo(-30,-58); ctx.lineTo(-22+Math.cos(p)*7,-36+Math.sin(p)*7); ctx.moveTo(-30,-58); ctx.lineTo(-22-Math.cos(p)*7,-36-Math.sin(p)*7); ctx.stroke();
+  rider(-34,-58,b.poncho,.85);
+}
+function bagac(b){
+  wheel(-70,-11,11); wheel(-28,-11,11); wheel(36,-11,11);
+  ctx.fillStyle = "#6b5a43"; rr(-86,-30,74,10,2); ctx.fill();
+  ctx.fillStyle = "#c79b5a"; for (let i=0;i<3;i++){ rr(-84+i*24,-56,22,26,2); ctx.fill(); } rr(-74,-80,40,24,2); ctx.fill();
+  ctx.fillStyle = "rgba(47,95,179,.88)"; ctx.beginPath(); ctx.moveTo(-88,-30); ctx.quadraticCurveTo(-86,-86,-50,-86); ctx.quadraticCurveTo(-14,-86,-12,-30); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = "#e6d38a"; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(-70,-84); ctx.lineTo(-62,-30); ctx.moveTo(-36,-84); ctx.lineTo(-40,-30); ctx.stroke();
+  ctx.strokeStyle = "#444"; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(-12,-24); ctx.lineTo(14,-24); ctx.stroke();
+  ctx.fillStyle = b.color; ctx.beginPath(); ctx.moveTo(12,-20); ctx.quadraticCurveTo(16,-44,26,-50); ctx.lineTo(31,-46); ctx.quadraticCurveTo(23,-30,21,-18); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = "#8a8c96"; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(27,-50); ctx.lineTo(37,-11); ctx.stroke();
+  ctx.fillStyle = "#16161c"; rr(-6,-42,24,7,3); ctx.fill();
+  ctx.fillStyle = "#fff6d0"; ctx.beginPath(); ctx.arc(34,-54,3.6,0,7); ctx.fill();
+  rider(4,-42,b.poncho);
+}
+const FRONT = {xeso:[36,44], taxi:[72,72], bus:[128,128], cavien:[60,56], banhmi:[50,56], xichlo:[48,40], bagac:[38,88]};
+function drawBike(b, t){
+  const [f,bk] = FRONT[b.type];
+  lights(b.x, b.y, b.dir, f, bk, b.type==="bus"||b.type==="taxi");
+  ctx.save(); ctx.translate(b.x, b.y); ctx.scale(b.dir, 1);
+  if (b.type==="xeso") xeso(b); else if (b.type==="taxi") taxi(); else if (b.type==="bus") bus();
+  else if (b.type==="cavien"||b.type==="banhmi") cart(b,t,b.type); else if (b.type==="xichlo") xichlo(b,t); else bagac(b);
+  ctx.restore();
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  if (b.type==="taxi") signText("TAXI", b.x, b.y-69.5, "600 8px Oswald, sans-serif", "#3a2a00");
+  if (b.type==="bus") { signText("XE BUÝT", b.x - b.dir*40, b.y-45.5, "600 11px Oswald, sans-serif", "#1d5a37"); signText("18", b.x + b.dir*107, b.y-84, "600 7px Oswald, sans-serif", "#ffb347"); }
+  if (b.type==="cavien"||b.type==="banhmi") signText(b.type==="cavien" ? "CÁ VIÊN CHIÊN" : "BÁNH MÌ", b.x + b.dir*15, b.y-94.5, "600 9.5px Oswald, sans-serif", b.type==="cavien" ? "#fff2c8" : "#9a1e14");
+}
+function drawParked(){ for (const p of PARKED){ ctx.save(); ctx.translate(p.x,p.y); ctx.scale(p.dir*.9,.9); xeso(p); ctx.restore(); } }
+function cartTalk(b, now){
+  if (!b.sayAt) return;
+  if (now >= b.sayAt && !b.said) { b.said = rnd(CART_LINES[b.type]); speak(b.said, .9); }
+  if (b.said) { const age = now - b.sayAt; if (age < 5000) bubble(b.said, b.x + b.dir*15, b.y-110, age*2.4); else { b.said = ""; b.sayAt = now + 7000 + Math.random()*5000; } }
+}
+
+// ---------- weather: lâm râm → mưa vừa → mưa to → giông, with flooding ----------
+const W = { slot:null, level:.3, target:.3, phaseUntil: Date.now()+30000, nextBolt: Infinity, flash:0, bolt:null, boltAt:0, audioLevel:-1, flood:0, floodStage:0, stage:"lam" };
+const STAGES = ["lam","vua","to","giong"];
+const PHASES = [["lam",.22,34],["vua",.5,30],["to",.76,21],["giong",1,15]];
+const STAGE_MSG = { lam:"Mưa nhỏ lại, lâm râm.", vua:"Mưa nặng hạt dần.", to:"Mưa to rồi, trắng xóa cả đường.", giong:"Giông tới, sấm chớp đùng đùng." };
+function stageOf(L){ return L > .88 ? "giong" : L > .62 ? "to" : L > .38 ? "vua" : "lam"; }
+function phaseFor(slot){ const r = mulberry(slot*7919 + 17)(); let acc = 0; for (const p of PHASES){ acc += p[2]; if (r*100 < acc) return p; } return PHASES[0]; }
+function targetFor(slot){ let p = phaseFor(slot); if (p === phaseFor(slot-1)) p = PHASES[(PHASES.indexOf(p)+1) % PHASES.length]; return Math.max(.12, Math.min(1, p[1] + (mulberry(slot*31+5)()-.5)*.08)); }
+function pickPhase(){ let r = Math.random()*100; for (const p of PHASES){ if ((r -= p[2]) < 0) return p; } return PHASES[0]; }
+function makeBolt(){
+  const x0 = view.off + 60 + Math.random()*(view.w-120), pts = [[x0,FAC_TOP]]; let x = x0, y = FAC_TOP;
+  const yEnd = Math.max(FAC_TOP + 40, view.offY + 24);
+  while (y < yEnd) { y += 4 + Math.random()*7; x += (Math.random()-.5)*18; pts.push([x,y]); }
+  return pts;
+}
+function strike(strong){
+  W.bolt = strong ? makeBolt() : null; W.boltAt = performance.now(); W.flash = strong ? 1 : .35;
+  setTimeout(()=>thunderSound(strong), strong ? 120 + Math.random()*500 : 1200 + Math.random()*2200);
+}
+function updateWeather(now, dt){
+  const slot = Math.floor((window.QC_TIME ? window.QC_TIME() : Date.now()) / 45000);
+  if (slot !== W.slot) { const first = W.slot === null; W.slot = slot; W.target = targetFor(slot);
+    if (first) { W.level = W.target; W.stage = stageOf(W.level); } }
+  W.level += (W.target - W.level) * Math.min(1, .004*dt);
+  const st = stageOf(W.level);
+  if (st !== W.stage) { const up = STAGES.indexOf(st) > STAGES.indexOf(W.stage); W.stage = st; pushChat({kind:"sys", text: STAGE_MSG[st]}); weatherTalk(st, up); }
+  // thunder only belongs to heavy rain
+  if (W.level > .68) {
+    if (!isFinite(W.nextBolt)) W.nextBolt = now + 2500 + Math.random()*4000;
+    if (now > W.nextBolt) { const storm = W.level > .88; strike(storm && Math.random() < .65); W.nextBolt = now + (storm ? 3500 + Math.random()*7000 : 12000 + Math.random()*14000); }
+  } else W.nextBolt = Infinity;
+  // the street floods in heavy rain and drains slowly after
+  if (W.level > .66) W.flood = Math.min(1, W.flood + (W.level - .62)*.066*dt/60);
+  else W.flood = Math.max(0, W.flood - .012*dt/60);
+  const fsg = W.flood > .6 ? 2 : W.flood > .15 ? 1 : 0;
+  if (fsg !== W.floodStage) {
+    if (fsg > W.floodStage) { pushChat({kind:"sys", text: fsg === 2 ? "Nước ngập tới bánh xe, tràn lên lề rồi." : "Đường bắt đầu ngập."}); floodTalk(); }
+    else if (fsg === 0) pushChat({kind:"sys", text:"Nước rút rồi."});
+    W.floodStage = fsg;
+  }
+  W.flash *= Math.pow(.88, dt);
+  if (layers && Math.abs(W.level - W.audioLevel) > .02) { setLevelAudio(W.level); W.audioLevel = W.level; }
+}
+function drawFloodPlane(t){
+  const F = W.flood; if (F < .02) return;
+  const a = Math.min(.62, F*.9);
+  const g = ctx.createLinearGradient(0,496,0,600); g.addColorStop(0,`rgba(70,88,112,${a*.8})`); g.addColorStop(1,`rgba(38,50,68,${a})`);
+  ctx.fillStyle = g; ctx.fillRect(0,496,LW,1700);
+  ctx.save(); ctx.globalCompositeOperation = "lighter";
+  for (let i=0;i<16;i++){ const x = (i*71 + 40) % LW, w = 26 + (i%4)*18, y = 504 + (i*37)%90 + Math.sin(t/400+i)*2;
+    ctx.fillStyle = i%5 === 0 ? `rgba(90,230,150,${.09*F})` : `rgba(255,${190+i%3*20},140,${.09*F})`; ctx.fillRect(x + Math.sin(t/300+i)*6, y, w, 1.5); }
+  ctx.restore();
+  if (F > .55) {
+    const k = Math.min(1, (F-.55)/.45), top = 494 - 16*k;
+    ctx.fillStyle = `rgba(66,84,108,${.6*k})`; ctx.fillRect(0, top, LW, 496-top);
+    ctx.strokeStyle = `rgba(200,215,235,${.35*k})`; ctx.lineWidth = 1; ctx.beginPath();
+    for (let x=0; x<=LW; x+=8){ const yy = top + Math.sin(t/300 + x*.08)*1.2; if (x) ctx.lineTo(x,yy); else ctx.moveTo(x,yy); }
+    ctx.stroke();
+  }
+}
+function drawWade(b, t){
+  const F = W.flood; if (F < .08) return;
+  const d = F*24, x0 = b.x - b.half, w = b.half*2;
+  const wg = ctx.createLinearGradient(x0-10,0,x0+w+10,0), wa = .5+.25*F;
+  wg.addColorStop(0,"rgba(60,78,100,0)"); wg.addColorStop(.18,`rgba(60,78,100,${wa})`); wg.addColorStop(.82,`rgba(60,78,100,${wa})`); wg.addColorStop(1,"rgba(60,78,100,0)");
+  ctx.fillStyle = wg; ctx.fillRect(x0-10, b.y - d, w+20, d + 4);
+  ctx.strokeStyle = "rgba(210,225,240,.5)"; ctx.lineWidth = 1.2; ctx.beginPath(); ctx.moveTo(x0, b.y-d);
+  for (let x=x0; x<=x0+w; x+=6) ctx.lineTo(x, b.y - d + Math.sin(t/120 + x*.3)); ctx.stroke();
+  const fx = b.x + b.dir*b.half*.85, sp = Math.min(1, b.v/3) * F;
+  ctx.fillStyle = `rgba(225,235,245,${.65*sp})`;
+  for (let i=0;i<7;i++){ const ph = (t/90 + i*1.3) % 6, px = fx + b.dir*ph*3.2, py = b.y - d - Math.sin(ph/6*Math.PI)*12*sp; ctx.beginPath(); ctx.arc(px, py, 1.5, 0, 7); ctx.fill(); }
+  ctx.strokeStyle = `rgba(220,232,245,${.5*F})`; ctx.beginPath(); ctx.moveTo(b.x - b.dir*b.half, b.y-d+1);
+  ctx.quadraticCurveTo(b.x - b.dir*(b.half+30), b.y-d+5, b.x - b.dir*(b.half+64), b.y-d+3); ctx.stroke();
+}
+function drawBolt(t){
+  if (!W.bolt) return; const e = t - W.boltAt; if (e > 260) return;
+  ctx.save(); ctx.beginPath(); ctx.rect(0,FAC_TOP-60,LW,view.offY+30-FAC_TOP+60); ctx.clip();
+  ctx.strokeStyle = "rgba(235,240,255,.95)"; ctx.lineWidth = 2.4; ctx.shadowColor = "#cfe0ff"; ctx.shadowBlur = 14;
+  ctx.beginPath(); W.bolt.forEach(([x,y],i)=> i ? ctx.lineTo(x,y) : ctx.moveTo(x,y)); ctx.stroke(); ctx.restore();
+}
+function drawFlash(t){
+  if (W.flash < .02) return;
+  const e = t - W.boltAt, flick = e < 70 ? 1 : e < 130 ? .25 : e < 210 ? .85 : 1;
+  ctx.fillStyle = `rgba(215,225,255,${W.flash*flick*.5})`; ctx.fillRect(view.off,view.offY,view.w,view.h);
+}
+function drawRain(dt){
+  const L = W.level, n = Math.floor(DROP_N * (.25 + .75*L));
+  const spd = .8 + L*.75, slant = .14 + L*.32;
+  ctx.strokeStyle = `rgba(190,210,240,${.32+.25*L})`; ctx.lineWidth = 1 + L*.5; ctx.beginPath();
+  for (let i=0;i<drops.length;i++){ const d = drops[i];
+    d.y += d.v*spd*dt; d.x += d.v*spd*slant*dt;
+    if (d.y > d.ground || (d.x>92 && d.x<868 && d.y>158 && d.y<170)) {
+      if (i < n && d.y > d.ground && splashes.length < 60 + 110*L) splashes.push({x:d.x,y:d.ground,a:0,s:1+L});
+      Object.assign(d, newDrop(true)); d.y = -Math.random()*60; continue;
+    }
+    if (i >= n || sheltered(d.x,d.y)) continue;
+    const len = d.len*(1+L*.7);
+    ctx.moveTo(d.x,d.y); ctx.lineTo(d.x - len*slant, d.y - len);
+  }
+  ctx.stroke();
+  for (let i=splashes.length-1;i>=0;i--){ const s = splashes[i]; s.a += .07*dt;
+    if (s.a>=1){ splashes.splice(i,1); continue; }
+    ctx.strokeStyle = `rgba(200,220,250,${.5*(1-s.a)})`; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.ellipse(s.x,s.y,(2+s.a*7)*s.s,(1+s.a*2)*s.s,0,0,7); ctx.stroke(); }
+  if (L > .6) { ctx.fillStyle = `rgba(150,165,190,${(L-.6)*.22})`; ctx.fillRect(view.off,view.offY,view.w,view.h); }
+}
+
+let last = performance.now();
+function frame(t){
+  const dt = Math.max(0, Math.min(3, (t-last)/16.7)); last = t;
+  const now = Date.now();
+  updateWeather(now, dt);
+  const sc = view.scale*view.dpr;
+  ctx.setTransform(sc,0,0,sc,-view.off*sc,-view.offY*sc);
+  ctx.fillStyle = "#05070f"; ctx.fillRect(view.off,view.offY,view.w,view.h);
+  drawBackdrop(t);
+  drawBolt(t);
+  drawFloodPlane(t);
+  drawTarp(t);
+  drawTV(t);
+  drawCart(t);
+  drawParked();
+  const { map } = occupants();
+  const hovOcc = map.get(hover), hovFree = !(hovOcc && !hovOcc.isYou);
+  for (let ri=0; ri<ROWS.length; ri++){
+    SEATS.forEach((s,i)=>{ if (s.row !== ri) return; stool(s.x,s.y,i===hover && hovFree, s.row); const p = map.get(i); if (p) person(p,s,t); });
+    drawRowTables(ri, map, now, t);
+  }
+  if (t > nextBike) { if (bikes.length < 6) spawnBike(); nextBike = t + 2200 + Math.random()*4200; }
+  const live = audioLive();
+  for (const bk of bikes) { bk.cv = bk.v; for (const o of bikes) { if (o === bk || o.dir !== bk.dir) continue; const ahead = (o.x - bk.x)*bk.dir; if (ahead > 0 && ahead < bk.half + o.half + 24) bk.cv = Math.min(bk.cv, o.v*.95); } }
+  for (let i=bikes.length-1;i>=0;i--){ const bk = bikes[i]; bk.x += (bk.cv ?? bk.v)*(1-.4*W.flood)*bk.dir*dt;
+    if (live && !bk.snd) vehicleSound(bk);
+    if (bk.snd) updateVehicleSound(bk);
+    if (bk.honk && Math.abs(bk.x-480) < 90) { bk.honk = false; horn(bk.x, bk.type); }
+    if (bk.x < -bk.half-40 || bk.x > LW+bk.half+40) { stopVehicleSound(bk); bikes.splice(i,1); } }
+  bikes.sort((a,b)=>a.y-b.y);
+  for (const bk of bikes) { drawBike(bk,t); drawWade(bk,t); }
+  drawRain(dt);
+  const placed = [];
+  SEATS.forEach((s,i)=>{ const p = map.get(i); if (p) { label(p,s,now); placed.push([p,s]); } });
+  placed.sort((a,b)=> (a[0].isYou?1:0) - (b[0].isYou?1:0));
+  for (const [p,s] of placed){ const age = msgAge(p, now); if (age < 12000) bubble(p.msg, s.x, s.y-88, age); }
+  for (const bk of bikes) cartTalk(bk, now);
+  if (now - owner.at < 6000 && owner.msg) bubble(owner.msg, OWNER_X, 262, now-owner.at);
+  drawFlash(t);
+  if (me.seat === null) {
+    ctx.font = "500 13px 'Be Vietnam Pro', sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    const txt = "Chạm ghế đẩu trống để ngồi, chạm cô Ba để gọi món";
+    const w = ctx.measureText(txt).width + 24, cx = view.off + view.w/2;
+    ctx.fillStyle = "rgba(14,17,30,.82)"; rr(cx-w/2, 520, w, 28, 14); ctx.fill();
+    ctx.fillStyle = "#ffb85c"; ctx.fillText(txt, cx, 534.5);
+  }
+  positionYt();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
+</script>
+
+</body>
+</html>

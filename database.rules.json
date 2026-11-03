@@ -1,0 +1,54 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "rooms": {
+      "main": {
+        "peers": {
+          ".read": true,
+          "$peer": {
+            ".write": "$peer.length <= 40",
+            ".validate": "newData.hasChildren(['p', 't'])",
+            "t": {
+              ".validate": "newData.isNumber()"
+            },
+            "p": {
+              "nick": {
+                ".validate": "newData.isString() && newData.val().length <= 16"
+              },
+              "msg": {
+                ".validate": "newData.isString() && newData.val().length <= 80"
+              },
+              "$other": {
+                ".validate": "newData.isNumber() || newData.isBoolean() || (newData.isString() && newData.val().length <= 20)"
+              }
+            },
+            "$x": {
+              ".validate": "false"
+            }
+          }
+        },
+        "tv": {
+          ".read": true,
+          ".write": true,
+          ".validate": "newData.hasChildren(['id', 'at']) && newData.child('id').isString() && newData.child('id').val().length == 11 && newData.child('at').isNumber()"
+        },
+        "npcs": {
+          ".read": true,
+          ".write": true,
+          ".validate": "newData.hasChildren(['list', 'at'])"
+        },
+        "say": {
+          ".read": true,
+          ".indexOn": [
+            "at"
+          ],
+          "$id": {
+            ".write": true,
+            ".validate": "newData.hasChildren(['nick', 'text', 'at']) && newData.child('nick').isString() && newData.child('nick').val().length <= 20 && newData.child('text').isString() && newData.child('text').val().length <= 100 && newData.child('at').isNumber()"
+          }
+        }
+      }
+    }
+  }
+}

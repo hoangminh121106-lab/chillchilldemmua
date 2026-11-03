@@ -379,7 +379,13 @@ function renderDm(){
   const box = $("dmBox"), log = $("dmLog");
   if (!npcs.some(n=>n.nick===dmNick)) { closeDm(); return; }
   log.textContent = "";
-  for (const e of chat.filter(e => (e.kind==="me" && e.to===dmNick) || (e.kind==="ai" && e.who===dmNick && e.at >= box._t0)).slice(-8)) {
+  // only the private thread: what you said to this guest, and the first thing they said back each time
+  const thread = []; let waiting = false;
+  for (const e of chat) {
+    if (e.kind === "me" && e.to === dmNick) { thread.push(e); waiting = true; }
+    else if (e.kind === "ai" && e.who === dmNick && waiting) { thread.push(e); waiting = false; }
+  }
+  for (const e of thread.slice(-8)) {
     const li = document.createElement("li"); if (e.kind==="me") li.className = "me"; li.textContent = e.text; log.append(li);
   }
   if (typing.has(dmNick)) { const li = document.createElement("li"); li.className = "typing"; li.textContent = "đang gõ…"; log.append(li); }
@@ -811,6 +817,24 @@ Viết đúng lời ${n.nick} nói, một dòng, tối đa 28 chữ, không ghi 
 const AGE = { "anh Tư":"tao 52 rồi mày", "Long":"34 nè", "Minh":"28, già rồi", "Ngọc":"hỏi tuổi con gái chi z", "chị Hạnh":"chị 39 cưng", "Khoa":"25 nè", "Bin":"e 18 :))", "Bảo":"23, tuổi trẻ tài cao", "Thảo":"22, sắp ra trường", "Vy":"tui 24 nè", "Duy":"qua 30 rồi bậu", "O Hà":"tau 27 hỉ", "Dũng":"tui 31 rứa", "Tuấn":"tao 35", "Mike":"twenty nine, hai chín haha", "Sophie":"vingt-six, hai sáu" };
 const PRON = { "Vy":"tui", "Duy":"qua", "O Hà":"tau", "Dũng":"tui", "Mike":"tui", "Sophie":"tui", "chị Hạnh":"chị", "Bin":"e", "Bảo":"tui", "Thảo":"tui" };
 function scriptedReply(n, text){ const r = scriptedReply0(n, text), p = PRON[n.nick]; return p ? r.replace(/(^|\s)tao(?=\s|$)/g, "$1" + p) : r; }
+const FACTS = {
+  "anh Tư": { xe:"con Dream đời 99 nè, chạy hai chục năm chưa bỏ tao bữa nào", thich:"nhậu xị đế với coi đá gà… à coi bóng đá", tinh:"vợ tao ở nhà cầm cây chổi chờ kìa", nha:"hẻm 51 Bình Thạnh, hỏi chi, tính qua ăn chực hả" },
+  "Long": { xe:"chiếc Wave cà tàng, đề hông nổ phải đạp", thich:"ăn với ngủ, hề hề", tinh:"ế nè, giới thiệu đi", nha:"phòng trọ Gò Vấp, chật như hộp quẹt" },
+  "Minh": { xe:"Vision trả góp còn 8 tháng nữa", thich:"code xong đi ngủ, mà code hoài hông xong", tinh:"người yêu tao là cái laptop", nha:"trọ quận 7, sát công ty cho đỡ kẹt xe" },
+  "Ngọc": { xe:"con Lead chở hàng muốn sập yên", thich:"lên đơn với ngủ, có ai mua đồ bộ hông", tinh:"bồ bỏ rồi, giờ yêu tiền thôi", nha:"Tân Bình, gần chợ Tân Bình đó" },
+  "chị Hạnh": { xe:"chị chạy con SH Mode, chồng mua đó cưng", thich:"gội đầu cho người ta với nghe ngóng chuyện thiên hạ", tinh:"chị có chồng có con rồi cưng", nha:"tiệm gội kế bên nè, qua chơi" },
+  "Khoa": { xe:"Exciter độ pô, giao hàng cho lẹ", thich:"ngủ, giao hàng xong là ngủ", tinh:"ai thèm thằng shipper ướt nhẹp như tao", nha:"Thủ Đức, chạy vô đây muốn rụng bánh" },
+  "Bin": { xe:"e đi xe đạp điện :))", thich:"chơi game với lướt tiktok", tinh:"e còn nhỏ, chưa nghĩ tới :))", nha:"kí túc xá Làng Đại học" },
+  "Bảo": { xe:"Airblade nhưng mai mốt nổi là đổi Lambo", thich:"stream game, anh em vô follow giùm", tinh:"fan girl đầy, chỉ là chưa xuất hiện", nha:"quận 3, trên lầu nhà bà già" },
+  "Thảo": { xe:"Vespa cũ của ba, đề ba lần mới nổ", thich:"ngủ nướng với xem phim Hàn", tinh:"luận văn là người yêu tui giờ", nha:"trọ gần trường, Bình Thạnh" },
+  "Vy": { xe:"tui chạy con Janus hồng nè", thich:"ăn vặt với gọi video cho má", tinh:"chưa có ai hết trơn, buồn dữ thần", nha:"tui ở trọ Phú Nhuận, quê Cần Thơ" },
+  "Duy": { xe:"qua chạy Cub 50 chở đàn", thich:"đàn hát bolero cho bậu nghe", tinh:"qua còn chờ bậu đó", nha:"qua ở quận 8 nghen" },
+  "O Hà": { xe:"tau đi xe buýt hỉ", thich:"nấu bún bò với đi chùa", tinh:"chi mà hỏi rứa, ngại hè", nha:"tau trọ quận 10" },
+  "Dũng": { xe:"Sirius cũ, chở đồ nghề điện", thich:"sửa đồ điện với ăn mì Quảng", tinh:"có vợ ở quê rồi nì", nha:"tui ở Tân Phú" },
+  "Tuấn": { xe:"tao đi Grab, đi công tác mà", thich:"đi cà phê, mà cà phê trong này ngọt quá", tinh:"vợ con ngoài Hà Nội cả", nha:"tao ở khách sạn quận 1" },
+  "Mike": { xe:"tui thuê xe máy, almost crash 3 lần haha", thich:"ăn street food, phở, bánh mì", nha:"Bùi Viện, very loud" },
+  "Sophie": { xe:"tui đi bộ, hông dám chạy xe ở đây", thich:"chụp hình và ăn bánh mì", nha:"khách sạn quận 1" },
+};
 function scriptedReply0(n, text){
   const P = PERSONAS[n.nick], t = " " + norm(text).replace(/[^a-z0-9?]+/g," ").replace(/\?/g," ? ") + " ";
   const has = (...ws) => ws.some(w => t.includes(" " + w + " "));
@@ -820,6 +844,11 @@ function scriptedReply0(n, text){
   if (has("la ai","ai vay","robot","bot","ai a","phai ai")) return rnd(["ờ tao AI nè, mà tao cũng biết đói á","AI mà ngồi quán cóc, lạ hông","tao khách ảo thôi, mà tám thiệt đó"]);
   if (has("ten gi","ten la gi","ten chi","ten j","ten")) return rnd([`tao là ${short} nè, gọi hoài mà hỏi tên`,`${short} đó, nhớ dùm cái`]);
   if (has("may tuoi","bao nhieu tuoi","tuoi")) return AGE[n.nick] || "hỏi tuổi chi, già rồi";
+  const F = FACTS[n.nick] || {};
+  if (has("xe gi","chay xe gi","chiec xe","xe may","di xe") && F.xe) return F.xe;
+  if (has("thich gi","so thich","thich lam gi","ranh lam gi") && F.thich) return F.thich;
+  if (has("co vo","co chong","co bo","co ny","nguoi yeu","doc than","co ghe")) return F.tinh || rnd(["hỏi chi, tính làm mai hả","ế chỏng chơ nè, vui chưa"]);
+  if (has("nha o dau","o quan may","o dau vay","song o dau") && F.nha) return F.nha;
   if (has("lam nghe gi","lam gi","nghe gi","nghe","di lam","cong viec")) return `tao ${job} đó`;
   if (has("que o dau","que dau","o dau","que")) return `quê tao ${P.region} nè`;
   if (has("khoe khong","khoe ko","khoe hong","khoe","on khong","sao roi","the nao","lam sao roi","lam sao")) return rnd(["cũng ổn, mệt xíu thôi","khỏe re, còn mày?","tàm tạm, mưa vầy hơi oải","có sao đâu, ngồi uống nước nè"]);

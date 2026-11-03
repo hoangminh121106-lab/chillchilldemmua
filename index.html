@@ -47,7 +47,7 @@
     db.ref("rooms/main/tv").on("value", s => { const v = s.val(); tvCbs.forEach(f => f(v, Date.now() + offset)); });
     let timer = 0;
     window.QC_SYNC = {
-      setTv(id){ return id ? db.ref("rooms/main/tv").set({ id, at: TS }) : db.ref("rooms/main/tv").remove(); },
+      setTv(id, off){ return id ? db.ref("rooms/main/tv").set({ id, at: TS, off: Math.max(0, Math.round(Number(off) || 0)) }) : db.ref("rooms/main/tv").remove(); },
       onTv(f){ tvCbs.push(f); },
       npcs: true,
       isLeader(){ if (!peersLoaded || !conn) return false; const k = activeKeys(); return !k.length || k[0] === me; },
@@ -182,6 +182,11 @@ button.b:disabled{opacity:.45;cursor:not-allowed}
 .tvrow{display:flex;flex-wrap:wrap;gap:8px}
 .tvrow input{flex:1 1 220px}
 .filebtn{display:inline-flex;align-items:center}
+.seekrow{display:flex;align-items:center;gap:10px}
+.seekrow[hidden]{display:none}
+.seekrow input[type=range]{flex:1;min-width:0;accent-color:var(--amber)}
+.seekrow .tnum{font-size:12.5px;color:var(--muted);font-variant-numeric:tabular-nums;min-width:38px;text-align:center}
+.seekbtn{padding:4px 10px;font-size:12px;min-width:38px}
 .ytlink{color:var(--amber);font-size:14px;font-weight:500}
 .msgrow{display:flex;gap:8px}
 .aistat{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;font-size:12.5px;color:var(--muted)}
@@ -256,6 +261,12 @@ ul.people li.sim .n{color:var(--muted)}
       <input type="file" id="tvFile" accept="video/*" hidden>
       <button class="b" id="tvBongda" type="button">Kênh bóng đá</button>
       <button class="b" id="tvOff" type="button">Tắt TV</button>
+    </div>
+    <div class="seekrow" id="seekRow" hidden>
+      <button class="b seekbtn" id="tvPlay" type="button" aria-label="Tạm dừng">❚❚</button>
+      <span class="tnum" id="seekCur">0:00</span>
+      <input type="range" id="tvSeek" min="0" max="1000" value="0" step="1" aria-label="Tua video">
+      <span class="tnum" id="seekDur">0:00</span>
     </div>
     <p class="hint" id="tvStatus">TV đang chiếu bóng đá. Dán link YouTube để cả quán xem chung, hoặc chọn/kéo thả video trong máy để xem riêng.</p>
   </div>
@@ -1669,6 +1680,28 @@ function ytIdFrom(u){
   return m ? m[1] : "";
 }
 function stopVideo(){ try { tvVideo.pause(); } catch(e){} }
+// ---- thanh tua video: video trong máy, hoặc YouTube (bản web gắn thêm window.QC_YT) ----
+const seekRow = $("seekRow"), tvSeek = $("tvSeek"); let seeking = false;
+const fmtT = t => { t = Math.max(0, Math.floor(t || 0)); const h = Math.floor(t/3600), m = Math.floor(t%3600/60), sec = String(t%60).padStart(2,"0"); return h ? `${h}:${String(m).padStart(2,"0")}:${sec}` : `${m}:${sec}`; };
+function tvTimes(){
+  if (tv.mode === "video" && isFinite(tvVideo.duration) && tvVideo.duration > 0) return { cur: tvVideo.currentTime, dur: tvVideo.duration, paused: tvVideo.paused };
+  if (tv.mode === "yt" && window.QC_YT) return window.QC_YT.times();
+  return null;
+}
+function tvSeekTo(t){ if (tv.mode === "video") { try { tvVideo.currentTime = t; } catch(e){} } else if (tv.mode === "yt" && window.QC_YT) window.QC_YT.seek(t); }
+function tvTogglePlay(){ if (tv.mode === "video") { tvVideo.paused ? tvVideo.play().catch(()=>{}) : tvVideo.pause(); } else if (tv.mode === "yt" && window.QC_YT) window.QC_YT.toggle(); }
+function updateSeek(){
+  const tm = tvTimes();
+  seekRow.hidden = !tm || !(tm.dur > 0);
+  if (seekRow.hidden) return;
+  $("seekDur").textContent = fmtT(tm.dur);
+  $("tvPlay").textContent = tm.paused ? "▶" : "❚❚"; $("tvPlay").setAttribute("aria-label", tm.paused ? "Phát" : "Tạm dừng");
+  if (!seeking) { tvSeek.value = String(Math.round(tm.cur / tm.dur * 1000)); $("seekCur").textContent = fmtT(tm.cur); }
+}
+setInterval(updateSeek, 500);
+tvSeek.addEventListener("input", () => { seeking = true; const tm = tvTimes(); if (tm) $("seekCur").textContent = fmtT(tvSeek.value/1000 * tm.dur); });
+tvSeek.addEventListener("change", () => { const tm = tvTimes(); if (tm) tvSeekTo(tvSeek.value/1000 * tm.dur); seeking = false; setTimeout(updateSeek, 300); });
+$("tvPlay").addEventListener("click", () => { tvTogglePlay(); setTimeout(updateSeek, 200); });
 function playFile(f){
   if (!f || !/^video\//.test(f.type || "video/")) { tvStatus.textContent = "File này không phải video. Chọn file .mp4 nha."; return; }
   stopYt(false);
@@ -1721,8 +1754,13 @@ function stopYt(shared){
   if (ytPlayer && ytReady) { try { ytPlayer.stopVideo(); } catch(e){} }
   if (shared && window.QC_SYNC) window.QC_SYNC.setTv(null);
 }
+let ytKey = "";
 function applyTvState(v, serverNow){
-  if (v && typeof v.id === "string" && /^[A-Za-z0-9_-]{11}$/.test(v.id)) { if (v.id !== ytCur) playYt(v.id, (serverNow - (Number(v.at)||serverNow))/1000); }
+  if (v && typeof v.id === "string" && /^[A-Za-z0-9_-]{11}$/.test(v.id)) {
+    const off = Number(v.off) || 0, pos = off + (serverNow - (Number(v.at)||serverNow))/1000, key = v.id + "|" + v.at + "|" + off;
+    if (v.id !== ytCur) { ytKey = key; playYt(v.id, pos); }
+    else if (key !== ytKey) { ytKey = key; if (ytPlayer && ytReady) { try { ytPlayer.seekTo(Math.max(0, pos), true); ytPlayer.playVideo(); } catch(e){} } }   // có người tua: cả quán tua theo
+  }
   else if (tv.mode === "yt") { stopYt(false); tv.mode = "bongda"; tvStatus.textContent = "TV đang chiếu bóng đá."; }
 }
 $("ytForm").addEventListener("submit", e => {
@@ -1734,6 +1772,13 @@ $("ytForm").addEventListener("submit", e => {
   ownerSay("Dạ để em mở tivi cho cả quán coi nghen!");
 });
 document.addEventListener("pointerdown", () => { if (ytPlayer && ytReady) { try { ytPlayer.unMute(); } catch(e){} } }, { once:true });
+window.QC_YT = {
+  times(){ if (!ytPlayer || !ytReady || !ytCur) return null; try { return { cur: ytPlayer.getCurrentTime() || 0, dur: ytPlayer.getDuration() || 0, paused: ytPlayer.getPlayerState() === 2 }; } catch(e){ return null; } },
+  seek(t){ if (!ytCur) return; t = Math.max(0, t);
+    if (window.QC_SYNC) window.QC_SYNC.setTv(ytCur, t).catch(() => { try { ytPlayer.seekTo(t, true); } catch(e){} });
+    else { try { ytPlayer.seekTo(t, true); } catch(e){} } },
+  toggle(){ if (!ytPlayer || !ytReady) return; try { ytPlayer.getPlayerState() === 2 ? ytPlayer.playVideo() : ytPlayer.pauseVideo(); } catch(e){} },   // tạm dừng chỉ ở máy mình
+};
 function positionYt(){
   if (ytBox.hidden) return;
   const k = TVW*view.scale/356;

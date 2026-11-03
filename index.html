@@ -73,6 +73,7 @@
     if (r.status === 429) throw { code:"rate_limited", message:"Chậm lại xíu" };
     if (!r.ok) throw { code:"upstream_error", message:String(r.status) };
     const j = await r.json();
+    if (j.provider) window.QC_AI_LAST = j.provider;
     return { text: j.text || "", truncated: false };
   }
   window.QC_AI_NAME = "Gemini";
@@ -492,7 +493,7 @@ const AI_ERR = {
 };
 function setAiStatus(ok, code){
   const el = $("aiStat"), fix = $("aiFix"); el.parentElement.dataset.ok = ok ? "1" : "0";
-  if (ok) { el.textContent = `Khách AI: đang trả lời bằng ${AI_NAME}`; fix.hidden = true; return; }
+  if (ok) { const nm = ({ gemini:"Gemini", claude:"Claude", chatgpt:"ChatGPT" })[window.QC_AI_LAST] || AI_NAME; el.textContent = `Khách AI: đang trả lời bằng ${nm}`; fix.hidden = true; return; }
   el.textContent = `Khách AI đang nói câu soạn sẵn vì ${AI_ERR[code] || (AI_NAME + " chưa trả lời được (" + code + ")")}.`;
   fix.hidden = !(code === "not_granted" || code === "unavailable" || code === "timeout");
 }

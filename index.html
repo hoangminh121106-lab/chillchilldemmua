@@ -404,7 +404,7 @@ function renderChat(){
     if (e.kind === "sys") { li.className = "sys"; li.textContent = e.text; }
     else {
       if (e.kind === "ai") { const t = document.createElement("span"); t.className = "tag"; t.textContent = "AI"; li.append(t); }
-      const w = document.createElement("span"); w.className = "who"; w.textContent = e.who + (e.kind==="me" ? " (bạn)" : "");
+      const w = document.createElement("span"); w.className = "who"; w.textContent = e.who;
       w.style.color = e.kind === "me" ? "var(--amber)" : e.kind === "owner" ? "var(--leaf)" : `hsl(${e.hue} 70% 72%)`;
       const tx = document.createElement("span"); tx.textContent = e.text;
       li.append(w, tx);
@@ -675,7 +675,7 @@ function realSeats(){ const s = new Set(); if (me.seat !== null) s.add(me.seat);
 function freeSeats(){ const used = realSeats(); for (const n of npcs) used.add(n.seat); return SEATS.map((_,i)=>i).filter(i=>!used.has(i)); }
 function pickName(used){ const pool = NPC_NAMES.filter(n=>!used.has(n)); let tot = pool.reduce((a,n)=>a+PERSONAS[n].w,0), r = Math.random()*tot; for (const n of pool){ if ((r -= PERSONAS[n].w) < 0) return n; } return pool[0]; }
 function addNpc(quiet, forceName){
-  const f = freeSeats(); if (!f.length) return null;
+  const f = npcFreeSeats(); if (!f.length) return null;
   const used = new Set(npcs.map(n=>n.nick));
   const nick = forceName && !used.has(forceName) ? forceName : pickName(used); if (!nick) return null;
   const map0 = occupants().map, lone = f.filter(i => !map0.has(mateOf(i)));
@@ -688,10 +688,12 @@ function addNpc(quiet, forceName){
   setTimeout(()=>{ if (npcs.includes(n)) { n.drink = rnd(Object.keys(DRINKS)); n.servedAt = Date.now(); renderPeople(); } }, 1800 + Math.random()*2500);
   return n;
 }
+const TV_SEATS = new Set(SEATS.map((s,i) => (s.row === 0 && s.x > 450 && s.x < 612) ? i : -1).filter(i => i >= 0));
+function npcFreeSeats(){ return freeSeats().filter(i => !TV_SEATS.has(i)); }
 function settleNpcs(){
   const rs = realSeats();
   for (const n of [...npcs]) {
-    if (rs.has(n.seat)) { const f = freeSeats().filter(i=>!rs.has(i)); if (f.length) n.seat = rnd(f); else npcs = npcs.filter(x=>x!==n); }
+    if (rs.has(n.seat) || TV_SEATS.has(n.seat)) { const f = npcFreeSeats().filter(i=>!rs.has(i)); if (f.length) n.seat = rnd(f); else npcs = npcs.filter(x=>x!==n); }
   }
 }
 function npcSay(n, text){
@@ -2037,7 +2039,7 @@ function drawRowTables(ri, occ, now, t){
 function label(p,s,now){
   const top = s.y - 74;
   ctx.font = "600 11px 'Be Vietnam Pro', sans-serif";
-  const name = p.isYou ? `${p.nick} (bạn)` : p.sim ? `${p.nick} · AI` : p.nick;
+  const name = p.nick;
   const w = Math.min(64, ctx.measureText(name).width + 12);
   ctx.fillStyle = p.isYou ? "rgba(255,184,92,.92)" : p.sim ? "rgba(24,28,44,.62)" : "rgba(14,17,30,.82)";
   rr(s.x-w/2, top-8, w, 16, 8); ctx.fill();

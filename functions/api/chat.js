@@ -30,7 +30,7 @@ export async function onRequestPost({ request, env }) {
         headers: { "content-type": "application/json", "x-goog-api-key": key },
         body: JSON.stringify({
           contents: [{ role: "user", parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 1, maxOutputTokens: 400 },
+          generationConfig: { temperature: 1.15, topP: 0.95, maxOutputTokens: 500 },
         }),
       });
     } catch { continue; }

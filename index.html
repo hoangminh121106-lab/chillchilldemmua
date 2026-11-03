@@ -53,7 +53,7 @@
       isLeader(){ if (!peersLoaded || !conn) return false; const k = activeKeys(); return !k.length || k[0] === me; },
       setNpcs(list){ return db.ref("rooms/main/npcs").set({ list, at: TS }).catch(()=>{}); },
       onNpcs(f){ npcCbs.push(f); },
-      sayNpc(nick, text){ return db.ref("rooms/main/say").push({ nick: String(nick).slice(0,20), text: String(text).slice(0,100), at: TS }).catch(()=>{}); },
+      sayNpc(nick, text){ return db.ref("rooms/main/say").push({ nick: String(nick).slice(0,20), text: String(text).slice(0,170), at: TS }).catch(()=>{}); },
       onSay(f){ sayCbs.push(f); },
     };
     return {
@@ -647,6 +647,18 @@ const NPC_PAIRS = [
   [["Dũng","dây điện ngoài tê rối như tơ vò nì"],["Minh","vậy mà wifi vẫn mạnh, hay ghê"]],
   [["Bảo","tui mới làm clip trend 'hồi chiều trời mưa'"],["Thảo","ai mượn, giờ vẫn còn mưa nè"]],
 ];
+// live trending topics (web version: /api/trends, refreshed by Gemini + Google Search every few hours)
+const LIVE = { topics: [], slang: [] };
+fetch("api/trends").then(r => r.ok ? r.json() : null).then(j => {
+  if (!j) return;
+  const ok = a => Array.isArray(a) ? a.filter(x => typeof x === "string").map(x => clean(x, 90)).filter(Boolean).slice(0, 15) : [];
+  LIVE.topics = ok(j.topics); LIVE.slang = ok(j.slang);
+}).catch(() => {});
+function liveLine(){
+  if (!LIVE.topics.length) return null;
+  const t = rnd(LIVE.topics), low = t.charAt(0).toLowerCase() + t.slice(1);
+  return rnd([`ê nghe vụ ${low} chưa`, `dạo này trên mạng toàn nói ${low}`, `tối nay lướt thấy ${low}, ghê ha`, `mấy đứa coi vụ ${low} chưa, tao cười xỉu`]);
+}
 const MOODS = ["đang vui, hơi lầy","mệt rã rời","buồn ngủ díp mắt","hơi quạu vì mưa","đang đói","hứng chí muốn kể chuyện","đang nhớ nhà","bình thường, ngồi chill"];
 const TOPICS = [
   "11.11 sắp tới, ai cũng săn sale Shopee, TikTok Shop",
@@ -709,6 +721,8 @@ function seedNpcs(){
   npcs.forEach((n,i)=>{ n.drink = ks[(i*2+1)%ks.length]; if (i%2===0) n.food = fs[i%fs.length]; });
   if (npcs[0]) npcSay(npcs[0], fresh(linesFor(npcs[0])));
 }
+const WEB_AI = window.QC_AI_NAME === "Gemini";
+let lastAiChatter = 0, lastHumanChat = 0;
 let pairBusy = false; const recentPairs = [];
 setInterval(()=>{
   if (!simOn || document.hidden || typing.size || pairBusy || !isLeader()) return;
@@ -720,7 +734,9 @@ setInterval(()=>{
     npcSay(npcs.find(n=>n.nick===a), la);
     setTimeout(()=>{ const nb = npcs.find(n=>n.nick===b); if (nb) npcSay(nb, lb); pairBusy = false; }, 2500 + Math.random()*1500);
   }
-  else if (r < .55 && npcs.length) { const n = rnd(npcs); npcSay(n, fresh(linesFor(n))); }
+  else if (r < .55 && npcs.length) { const n = rnd(npcs);
+    if (WEB_AI && Date.now() - lastAiChatter > 150000 && Date.now() - lastHumanChat < 600000) { lastAiChatter = Date.now(); npcSpeak(n, `${n.nick} tự nhiên kiếm chuyện tám: lôi một chuyện hot dạo này ra nói, hoặc cà khịa một người trong quán dựa trên chat gần đây.`); }
+    else { const live = PERSONAS[n.nick].sg && Math.random() < .35 ? liveLine() : null; npcSay(n, live || fresh(linesFor(n))); } }
   else if (r < .68 && npcs.length < 7) { addNpc(); }
   else if (r < .78 && npcs.length > 3) { const n = npcs.splice(Math.floor(Math.random()*npcs.length),1)[0]; pushChat({kind:"sys", text:`${n.nick} (AI) trả tiền rồi chạy về.`}); }
   else if (npcs.length) { const n = rnd(npcs); if (Math.random()<.5){ n.food = rnd(Object.keys(FOODS)); n.foodAt = Date.now(); } else { n.drink = rnd(Object.keys(DRINKS)); n.servedAt = Date.now(); } ownerSay(rnd(["Có liền nghen!","Đợi em xíu nghen!","Dạ nè, của anh nè!","Ra liền liền nè!"])); }
@@ -734,12 +750,12 @@ function weatherTalk(st, up){
 }
 function floodTalk(){ if (simOn && npcs.length && isLeader()) setTimeout(()=>{ if (npcs.length) npcSay(rnd(npcs), fresh(FLOOD_LINES)); }, 1500 + Math.random()*2000); }
 
-function recentChat(){ return chat.filter(e=>e.kind!=="sys").slice(-12).map(e=>`${e.who}: ${e.text}`).join("\n"); }
+function recentChat(){ return chat.filter(e=>e.kind!=="sys").slice(-20).map(e=>`${e.who}: ${e.text}`).join("\n"); }
 function tidy(t, n){
   let s = String(t||"").split("\n").map(x=>x.trim()).filter(Boolean)[0] || "";
   s = s.replace(new RegExp("^\\**"+n.nick.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")+"\\**\\s*:\\s*","i"),"").replace(/^["“”'\s]+|["“”'\s]+$/g,"").replace(/\.$/,"");
   if (!/^(Mike|Sophie)$/.test(n.nick) && s.length > 1 && /^[A-ZÀ-Ỹ]/.test(s) && !/^[A-Z]{2}/.test(s)) s = s[0].toLowerCase() + s.slice(1);
-  return clean(s, 90);
+  return clean(s, 170);
 }
 const WEATHER_TXT = { lam:"mưa lâm râm", vua:"mưa vừa", to:"mưa to trắng xóa", giong:"mưa giông, sấm chớp đùng đùng" };
 async function npcSpeak(n, task, fallback){
@@ -752,31 +768,32 @@ async function npcSpeak(n, task, fallback){
   if (sample) {
     const weather = (WEATHER_TXT[W.stage] || "trời mưa") + (W.flood > .15 ? ", đường đang ngập nước" : "");
     const mine = chat.filter(e=>e.who===n.nick && e.kind==="ai").slice(-6).map(e=>`"${e.text}"`).join(", ") || "(chưa nói gì)";
+    const topics = shuffle(LIVE.topics).slice(0,3).concat(shuffle(TOPICS).slice(0, LIVE.topics.length ? 1 : 3));
+    const slang = shuffle(LIVE.slang.concat(TRENDS)).slice(0,5);
     const prompt =
 `Mày đóng vai ${n.nick}: ${P.desc}. Quê/giọng: ${P.region}.
 Cách nói riêng của ${n.nick}: ${P.quirks}.
 Vài câu ${n.nick} hay nói, chỉ để bắt giọng, CẤM chép lại: "${shuffle(P.ex).slice(0,3).join('" / "')}"
 Tâm trạng lúc này: ${rnd(MOODS)}.
 
-Bối cảnh: khuya, ${weather}, quán cà phê cóc vỉa hè Sài Gòn, ngồi ghế đẩu, cô Ba bán nước. Mọi người tám chuyện như quen lâu.
-Chuyện người ta đang bàn tán dạo này (chỉ lôi vào nếu hợp mạch, đừng nhồi): ${shuffle(TOPICS).slice(0,3).join("; ")}.
-Câu cửa miệng đang trend trên mạng (lâu lâu chêm một câu nếu hợp, đừng lần nào cũng dùng): ${shuffle(TRENDS).slice(0,4).join(", ")}.
+Bối cảnh: khuya, ${weather}, quán cà phê cóc vỉa hè Sài Gòn, ngồi ghế đẩu, cô Ba bán nước. Đám này quen nhau lâu, nói chuyện như bạn chí cốt.
+Chuyện hot đang được bàn tán dạo này (lôi vào khi hợp mạch, hoặc khi đang hết chuyện): ${topics.join("; ")}.
+Từ lóng, câu trend đang hot trên mạng (chêm đúng lúc cho có duyên, đừng câu nào cũng nhồi): ${slang.join(", ")}.
 
-Luật để nghe như người thật chứ không như AI:
-- Nói như nói miệng ngoài đời: viết thường, ngắn, có khi cụt ngủn 1-3 chữ, không chấm câu cuối.
-- Đừng cố tỏ ra hài hay thông minh, không chơi chữ, không khuyên răn, không lặp lại hay tóm tắt câu người ta vừa nói, đừng lúc nào cũng hỏi ngược lại.
-- Được trả lời lệch đề, kể chuyện của mình, than thở, hay chỉ "ờ", "thiệt hông".
-- Thân, không khách sáo: không dùng "bạn", "mình", "ạ", "dạ" (trừ khách nước ngoài nói bập bẹ).
-- Giữ đúng giọng vùng miền ở trên.
-- Không chửi tục nặng, không xúc phạm ai, không bàn chính trị.
-- Bị hỏi thẳng có phải AI không thì nhận kiểu giỡn.
+Tính cách khi nói chuyện:
+- MỎ HỖN có duyên: cà khịa, chọc quê, đá xéo, nói móc, lật kèo, giả bộ khinh khỉnh rồi cười, kiểu bạn thân hay chửi yêu. Thấy người ta khoe là dìm, thấy than là chọc rồi mới an ủi.
+- THÔNG MINH, LANH: trả lời đúng trọng tâm câu được hỏi; hỏi kiến thức thì trả lời đúng nhưng bằng giọng cà khịa; có chính kiến riêng, dám cãi; nhớ chuyện người ta kể trước đó trong chat để móc lại.
+- THOẢI MÁI: nói như nói miệng, viết thường, 1-2 câu ngắn, không chấm câu cuối; có khi chỉ 2-4 chữ cho phũ. Không khách sáo: cấm "bạn", "mình", "ạ", "dạ" (trừ khách Tây nói bập bẹ). Giữ đúng giọng vùng miền.
+- Hỗn nhưng không ác: được nói "trời má", "vãi", "khùng hả", "bớt xạo", "nói như đúng rồi"; KHÔNG chửi thề nặng, KHÔNG chê ngoại hình, gia đình, quê quán, giới tính, KHÔNG bàn chính trị, tôn giáo.
+- Không khuyên răn, không giảng đạo lý, không tóm tắt lại câu người ta vừa nói.
+- Bị hỏi có phải AI không thì nhận kiểu giỡn, rồi cà khịa lại.
 - Những câu ${n.nick} đã nói rồi, CẤM lặp lại hay na ná: ${mine}
 
 Chat gần đây trong quán:
 ${recentChat()}
 
 ${task}
-Viết đúng câu ${n.nick} nói, một dòng, tối đa 18 chữ, không ghi tên.`;
+Viết đúng lời ${n.nick} nói, một dòng, tối đa 28 chữ, không ghi tên.`;
     try { const r = await Promise.race([ sample(prompt, { modelTier:"quick", cache:false }), new Promise((_, rej) => setTimeout(() => rej({ code:"timeout" }), 15000)) ]); reply = tidy(r.text, n); }
     catch(e) { const code = (e && e.code) || "upstream_error"; setAiStatus(false, code); if (code === "not_granted") aiOff = true; }
     if (reply) setAiStatus(true);
@@ -916,7 +933,7 @@ function startSharedNpcs(){
     if (!isLeader() && has) applyNpcList(list, false);
   });
   S.onSay(({ nick, text }) => {
-    const n = npcs.find(x => x.nick === nick); text = clean(text, 90); if (!text) return;
+    const n = npcs.find(x => x.nick === nick); text = clean(text, 170); if (!text) return;
     if (n) { n.msg = text; n.msgAt = Date.now(); }
     remember(text); pushChat({ who:nick, text, kind:"ai", hue: n ? n.hue : 200 });
     if (n) { autoActFromText(n, text); if (Math.random() < .25 && npcs.length > 1) { const m = rnd(npcs.filter(x=>x!==n)); if (m) setTimeout(()=>doAct(m, "cuoi"), 700); } }
@@ -1030,6 +1047,7 @@ $("msgForm").addEventListener("submit", e => {
   e.preventDefault();
   const v = clean($("msg").value, 80); if (!v) return;
   const now = Date.now(); if (now - lastSend < 1500) return; lastSend = now;
+  lastHumanChat = now;
   me.msg = v; me.msgAt = now; $("msg").value = ""; autoActFromText(me, v); sendPresence();
   pushChat({who:myName(), text:v, kind:"me", hue:me.hue});
   if (me.seat === null) ownerSay("Ngồi xuống đi rồi tám cho dui nè!");
@@ -1317,7 +1335,7 @@ $("dmForm").addEventListener("submit", e => {
   const v = clean($("dmMsg").value, 80); if (!v) return;
   const now = Date.now(); if (now - lastDm < 1500) return; lastDm = now;
   const n = npcs.find(x=>x.nick===dmNick); if (!n) return;
-  $("dmMsg").value = ""; me.msg = v; me.msgAt = now; autoActFromText(me, v); sendPresence();
+  lastHumanChat = now; $("dmMsg").value = ""; me.msg = v; me.msgAt = now; autoActFromText(me, v); sendPresence();
   pushChat({who:myName(), text:v, kind:"me", hue:me.hue, to:n.nick});
   aiReply(v, n);
 });
